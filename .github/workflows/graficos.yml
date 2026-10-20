@@ -1,0 +1,55 @@
+name: Graficos tecnicos
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "Tickers separados por comas (formato Yahoo)"
+        required: true
+        default: "PFE,NUE,PR,CNC"
+      estocastico:
+        description: "Añadir panel de estocastico"
+        type: boolean
+        default: false
+
+jobs:
+  graficos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install pandas numpy matplotlib yfinance openpyxl
+
+      - name: Generar graficos y patrones
+        env:
+          TICKERS: ${{ inputs.tickers }}
+          ESTOC: ${{ inputs.estocastico }}
+        run: |
+          EXTRA=""
+          if [ "$ESTOC" = "true" ]; then EXTRA="--estocastico"; fi
+          python generador_graficos.py --tickers "$TICKERS" $EXTRA
+
+      - name: Guardar resultados como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultados-graficos
+          path: salida_graficos/
+
+      - name: Enviar a Telegram (si hay secretos configurados)
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            for f in graficos_tecnicos.pdf resumen_patrones.xlsx datos_ohlcv.csv; do
+              curl -s -F chat_id="$TG_CHAT" -F document=@"salida_graficos/$f" \
+                "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" > /dev/null
+            done
+          fi
