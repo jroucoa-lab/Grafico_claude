@@ -21,7 +21,7 @@ jobs:
           path: cache_bt
           key: datos-bt-${{ github.run_id }}
           restore-keys: datos-bt-
-      - run: python backtest.py --años ${{ github.event.inputs.anios }}
+      - run: python backtest.py --sp500 --años ${{ github.event.inputs.anios }}
       - uses: actions/upload-artifact@v4
         with:
           name: backtest
