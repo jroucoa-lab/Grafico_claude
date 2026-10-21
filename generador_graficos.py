@@ -22,7 +22,9 @@ SALIDAS (carpeta --salida)
   resumen_patrones.xlsx  hojas Ranking, Resumen, Velas, Figuras, Avisos
   fichas.md              ficha tecnica por ticker + ultimas barras OHLCV
   graficos_tecnicos.pdf  2 paginas por ticker (diario + semanal), ordenadas por ranking
-  avisos.txt             problemas de datos
+  compras.txt            tickers en Compra, separados por comas (formato TradingView)
+  estado_datos.csv       por ticker: primera/ultima barra, dias de atraso y estado
+  avisos.txt             problemas de datos (huecos, sin barras nuevas, barra provisional)
 
 USO
   python generador_graficos.py                         # lee tickers.txt
@@ -30,6 +32,7 @@ USO
   python generador_graficos.py --detalle completo      # limpio | normal | completo
   python generador_graficos.py --solo-cache            # sin red
   python generador_graficos.py --refrescar             # fuerza descarga completa
+  python generador_graficos.py --telegram              # avisa si cambian las compras
   python generador_graficos.py --importar-csv datos_ohlcv.csv --descartar-ultima
 
 Dependencias: pip install pandas numpy matplotlib yfinance openpyxl lxml
@@ -38,6 +41,7 @@ AVISO: detecciones heuristicas para REVISAR visualmente. No es asesoramiento fin
 """
 import argparse
 import io
+import json
 import math
 import os
 import re
@@ -254,6 +258,45 @@ def actualizar_cache(tickers, cache, años, refrescar=False, solo_cache=False):
         for t in fallidos:
             avisos.append(f"{t}: sin datos de Yahoo" + (" (se usa cache antigua)" if t in datos else ""))
     return datos, avisos
+
+
+def barra_provisional_por_volumen(datos):
+    """Detecta la barra de hoy sin consolidar: Yahoo da volumenes que no son multiplos de 100
+    hasta que cierra el dia. Se decide con el conjunto de tickers, no con uno solo."""
+    ult = {t: d.index[-1] for t, d in datos.items() if not t.startswith("^") and len(d) > 3}
+    if len(ult) < 5:
+        return None, ""
+    L = max(ult.values())
+    en_L = [t for t, u in ult.items() if u == L]
+    if len(en_L) < 5:
+        return None, ""
+
+    def frac(fecha):
+        vs = [datos[t].loc[fecha, "Volume"] for t in en_L if fecha in datos[t].index]
+        vs = [v for v in vs if v > 0]
+        return (float(np.mean([v % 100 != 0 for v in vs])) if vs else np.nan), len(vs)
+
+    prev = sorted({datos[t].index[-2] for t in en_L})[-1]
+    fL, nL = frac(L)
+    fP, _ = frac(prev)
+    if nL >= 5 and np.isfinite(fL) and np.isfinite(fP) and fL >= 0.6 and fP <= 0.25:
+        return L, (f"{fL * 100:.0f}% de los volumenes del {L:%d/%m} no son multiplos de 100 "
+                   f"(el dia anterior {fP * 100:.0f}%)")
+    return None, ""
+
+
+def descartar_provisional(datos, cache):
+    L, det = barra_provisional_por_volumen(datos)
+    if L is None:
+        return []
+    n = 0
+    for t, d in list(datos.items()):
+        if len(d) and d.index[-1] == L:
+            datos[t] = d.iloc[:-1]
+            guardar_cache(cache, t, datos[t])
+            n += 1
+    return [f"Barra del {L:%Y-%m-%d} provisional ({det}): descartada en {n} series; "
+            f"se recalcula en la proxima ejecucion"]
 
 
 def importar_csv(ruta, cache, descartar_ultima=False):
@@ -800,7 +843,26 @@ def figuras(d, tf, ph, pl):
 # ============================================================================
 # Plan de compra
 # ============================================================================
-def plan_compra(c, a, sop, res, lows, cfg):
+def objetivos_figuras(figs, tf):
+    """Objetivo por altura proyectada de la figura (movimiento medido)."""
+    out = []
+    for f in figs:
+        n, t = f["nombre"], f["tipo"]
+        if t == "rect":
+            out.append((f["y1"] + (f["y1"] - f["y0"]), f"{n} {tf}"))
+        elif t == "bandera":
+            (_, pa), (_, pb) = f["mastil"]
+            out.append((f["nivel"] + (pb - pa), f"{n} {tf}"))
+        elif t == "taza":
+            left, bottom = f["pts"][0][1], f["pts"][1][1]
+            out.append((left + (left - bottom), f"{n} {tf}"))
+        elif t == "doble" and n == "Doble suelo":
+            lo = min(p for _, p in f["pts"])
+            out.append((f["nivel"] + (f["nivel"] - lo), f"{n} {tf}"))
+    return out
+
+
+def plan_compra(c, a, sop, res, lows, cfg, objetivos=(), trail=np.nan):
     """Entrada, stop, TP1/TP2 y acciones. Devuelve (plan | None, motivo)."""
     if not np.isfinite(a) or a <= 0:
         return None, "ATR no disponible"
@@ -824,12 +886,18 @@ def plan_compra(c, a, sop, res, lows, cfg):
     if riesgo_acc <= 0 or riesgo_acc / entrada > 0.12:
         return None, "stop a mas del 12% de la entrada"
     niveles = [p for p, _ in res if p > entrada * 1.005]
-    if len(niveles) >= 2:
-        tp1, tp2, tp_tipo = niveles[0], niveles[1], "resistencias"
-    elif len(niveles) == 1:
-        tp1, tp2, tp_tipo = niveles[0], entrada + max(3 * riesgo_acc, 2 * (niveles[0] - entrada)), "TP1 resistencia, TP2 multiplo R"
+    if niveles:
+        tp1, tp1_tipo = niveles[0], "resistencia"
     else:
-        tp1, tp2, tp_tipo = entrada + 1.5 * riesgo_acc, entrada + 3 * riesgo_acc, "multiplo R (sin resistencia por encima)"
+        tp1, tp1_tipo = entrada + 1.5 * riesgo_acc, "multiplo 1.5R (sin resistencia por encima)"
+    cand = [(v, nm) for v, nm in sorted(objetivos) if v > tp1 * 1.005]
+    if cand:
+        tp2, tp2_tipo = cand[0][0], f"altura de figura ({cand[0][1]})"
+    elif len(niveles) >= 2 and niveles[1] > tp1 * 1.005:
+        tp2, tp2_tipo = niveles[1], "resistencia"
+    else:
+        tp2, tp2_tipo = max(entrada + 3 * riesgo_acc, tp1 + riesgo_acc), "multiplo 3R (sin figura ni resistencia)"
+    tp_tipo = f"TP1 {tp1_tipo}; TP2 {tp2_tipo}"
     n_r = int(cfg["riesgo_max"] // riesgo_acc)
     n_c = int(cfg["max_pos"] // entrada)
     n = min(n_r, n_c)
@@ -837,7 +905,7 @@ def plan_compra(c, a, sop, res, lows, cfg):
         return None, "no cabe ni 1 accion"
     return {"modo": modo, "e_lo": e_lo, "e_hi": e_hi, "entrada": entrada, "stop": stop,
             "stop_tipo": stop_tipo, "riesgo_acc": riesgo_acc, "tp1": tp1, "tp2": tp2,
-            "tp_tipo": tp_tipo, "rr1": (tp1 - entrada) / riesgo_acc,
+            "tp_tipo": tp_tipo, "tp2_tipo": tp2_tipo, "trail": trail, "rr1": (tp1 - entrada) / riesgo_acc,
             "rr2": (tp2 - entrada) / riesgo_acc, "n_riesgo": n_r, "n_capital": n_c,
             "acciones": n, "limite": "riesgo" if n_r <= n_c else "capital",
             "capital": n * entrada, "riesgo_real": n * riesgo_acc}, ""
@@ -927,7 +995,12 @@ def analizar(t, raw, bench_d, bench_w, sec_d, sec_w, sector_nombre, cfg):
          "dist_max52": (c / D["hi52"] - 1) * 100,
          "vol_ratio": float(dd["Volume"].iloc[-1] / mv) if mv else np.nan,
          "poc": poc, "hvn_sop": hvn_s, "hvn_res": hvn_r}
-    plan, motivo = plan_compra(c, a, D["sop"], D["res"], lows_rec, cfg)
+    objetivos = objetivos_figuras(D["fig"], "D") + objetivos_figuras(W["fig"], "S")
+    sma30w = float(ind_w["sma30"].iloc[-1])
+    plan, motivo = plan_compra(c, a, D["sop"], D["res"], lows_rec, cfg, objetivos, sma30w)
+    if np.isfinite(r["vol_ratio"]) and r["vol_ratio"] < 0.35:
+        avisos.append(f"{t}: volumen de la ultima barra x{r['vol_ratio']:.2f} de la media 50d "
+                      f"(sesion corta o dato parcial)")
     r["plan"], r["plan_motivo"] = plan, motivo
     r["score"] = puntuar(r)
     clasificar(r)
@@ -1192,6 +1265,7 @@ def dibujar(pdf, r, tf, cfg):
         txt = (f"PLAN ({plan['modo']})\nEntrada {plan['e_lo']:.2f}-{plan['e_hi']:.2f}\n"
                f"Stop {plan['stop']:.2f} ({plan['stop_tipo']})\n"
                f"TP1 {plan['tp1']:.2f} (R {plan['rr1']:.1f})  TP2 {plan['tp2']:.2f} (R {plan['rr2']:.1f})\n"
+               f"Salida: cierre semanal < SMA30s ({f2(plan['trail'])})\n"
                f"{plan['acciones']} acc · capital {plan['capital']:.0f} · riesgo {plan['riesgo_real']:.0f}")
         ax.text(0.01, 0.90, txt, transform=ax.transAxes, fontsize=8.5, va="top", family="monospace",
                 bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#1f77b4", alpha=0.9), zorder=10)
@@ -1330,7 +1404,7 @@ def ficha(r, cfg):
     L.append("- Figuras: " + (" | ".join(fg) or "ninguna"))
     if p:
         L.append(f"- PLAN: entrada {p['e_lo']:.2f}–{p['e_hi']:.2f} ({p['modo']}); stop {p['stop']:.2f} ({p['stop_tipo']}); "
-                 f"TP1 {p['tp1']:.2f} (R:R {p['rr1']:.2f}); TP2 {p['tp2']:.2f} (R:R {p['rr2']:.2f}) [{p['tp_tipo']}]")
+                 f"TP1 {p['tp1']:.2f} (R:R {p['rr1']:.2f}); TP2 {p['tp2']:.2f} (R:R {p['rr2']:.2f}) [{p['tp_tipo']}]; salida principal: cierre semanal < SMA30s (hoy {f2(p['trail'])})")
         L.append(f"- Tamano: riesgo/accion {p['riesgo_acc']:.2f}; por riesgo {cfg['riesgo_max']:.0f}/{p['riesgo_acc']:.2f} = "
                  f"{p['n_riesgo']} acc; por capital {cfg['max_pos']:.0f}/{p['entrada']:.2f} = {p['n_capital']} acc; "
                  f"=> {p['acciones']} acc (limita {p['limite']}); capital {p['capital']:.0f}; riesgo real {p['riesgo_real']:.0f}")
@@ -1360,7 +1434,7 @@ def fila_ranking(r, pos):
     return {"Rank": pos, "Ticker": r["ticker"], "Direccion": r["dir"], "Score": r["score"],
             "Cierre": round(r["cierre"], 2), "Ultima barra": r["fecha"].date(),
             "Entrada min": n("e_lo"), "Entrada max": n("e_hi"), "Stop": n("stop"),
-            "TP1": n("tp1"), "TP2": n("tp2"), "RR TP1": n("rr1"), "RR TP2": n("rr2"),
+            "TP1": n("tp1"), "TP2": n("tp2"), "TP2 tipo": p["tp2_tipo"] if p else "", "Trailing SMA30s sem": n("trail"), "RR TP1": n("rr1"), "RR TP2": n("rr2"),
             "Acciones": p["acciones"] if p else np.nan, "Capital $": round(p["capital"]) if p else np.nan,
             "Riesgo real $": round(p["riesgo_real"]) if p else np.nan,
             "Limite": p["limite"] if p else "", "Modo entrada": p["modo"] if p else "", "Etapa": r["etapa"],
@@ -1393,6 +1467,48 @@ def fila_resumen(r):
             "Velas S (2 barras)": "; ".join(sorted({v["Patron"] for v in W["vel"] if v["pos"] >= nw - 2})),
             "Figuras D": "; ".join(f["nombre"] for f in D["fig"]),
             "Figuras S": "; ".join(f["nombre"] for f in W["fig"])}
+
+
+def mensaje_telegram(resultados, previo, fecha, siempre=False):
+    comp = {r["ticker"]: r for r in resultados if r["dir"] == "Compra"}
+    antes = set((previo or {}).get("compras", []))
+    nuevas = [t for t in comp if t not in antes]
+    salen = [t for t in antes if t not in comp]
+    if not (nuevas or salen or siempre):
+        return None
+    L = [f"Analisis tecnico · datos al {fecha:%d/%m/%Y}"]
+    if nuevas:
+        L.append(f"\nNUEVAS COMPRAS ({len(nuevas)}):")
+        for t in nuevas:
+            p = comp[t]["plan_usable"]
+            L.append(f"{t}: entrada {p['e_lo']:.2f}-{p['e_hi']:.2f} | stop {p['stop']:.2f} | TP1 {p['tp1']:.2f} | "
+                     f"TP2 {p['tp2']:.2f} | {p['acciones']} acc | {p['capital']:.0f}$ | riesgo {p['riesgo_real']:.0f}$"
+                     + (f" | AVISO: {comp[t]['alertas']}" if comp[t]["alertas"] else ""))
+    mant = [t for t in comp if t in antes]
+    if mant:
+        L.append("\nSIGUEN EN COMPRA: " + ", ".join(mant))
+    if salen:
+        dirs = {r["ticker"]: r["dir"] for r in resultados}
+        L.append("\nSALEN DE COMPRA: " + ", ".join(f"{t} ({dirs.get(t, 'sin datos')})" for t in salen))
+    if not comp:
+        L.append("\nSin compras hoy.")
+    return "\n".join(L)
+
+
+def enviar_telegram(texto, token, chat_id):
+    import urllib.parse
+    import urllib.request
+    trozos, cur = [], ""
+    for ln in texto.split("\n"):
+        if len(cur) + len(ln) + 1 > 3900:
+            trozos.append(cur)
+            cur = ""
+        cur += ln + "\n"
+    trozos.append(cur)
+    for tz in trozos:
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": tz}).encode()
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=20).read()
 
 
 def escribir_excel(ruta, df_rank, df_res, df_vel, df_fig, avisos):
@@ -1455,6 +1571,10 @@ def main():
     ap.add_argument("--marcar", type=int, default=15, help="Marcar velas de las ultimas N barras diarias")
     ap.add_argument("--barras-ficha", type=int, default=30, help="Barras diarias OHLCV en fichas.md")
     ap.add_argument("--estocastico", action="store_true")
+    ap.add_argument("--telegram", action="store_true", help="Avisa por Telegram si cambian las compras "
+                    "(variables TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID)")
+    ap.add_argument("--telegram-simular", action="store_true", help="Muestra el mensaje sin enviarlo")
+    ap.add_argument("--telegram-siempre", action="store_true", help="Envia aunque no haya cambios")
     ap.add_argument("--cuenta", type=float, default=100000)
     ap.add_argument("--riesgo", type=float, default=0.008, help="Riesgo maximo por operacion (fraccion)")
     ap.add_argument("--max-pos", type=float, default=5000, help="Capital maximo por posicion")
@@ -1496,6 +1616,14 @@ def main():
     sin_etf = [a for a in avisos if a.split(":")[0] in ETFS]
     if sin_etf:
         avisos = [a for a in avisos if a not in sin_etf] + [f"{len(sin_etf)} ETF sectoriales sin datos: RS vs sector no disponible"]
+    avisos += descartar_provisional(datos, args.cache)
+    ref = max((d.index[-1] for d in datos.values() if len(d)), default=None)
+    sin_barras = set()
+    for t in tickers:
+        if t in datos and len(datos[t]) and ref is not None and (ref - datos[t].index[-1]).days > 4:
+            sin_barras.add(t)
+            avisos.append(f"{t}: sin barras nuevas desde {datos[t].index[-1]:%Y-%m-%d} "
+                          f"(posible delisting, fusion o cambio de ticker); excluido")
     bench_d = datos[BENCH]["Close"] if BENCH in datos else None
     if bench_d is None:
         avisos.append("Sin ^GSPC: no se calculara RS Mansfield")
@@ -1508,6 +1636,8 @@ def main():
     for k, t in enumerate(tickers, 1):
         if t not in datos:
             avisos.append(f"{t}: sin datos")
+            continue
+        if t in sin_barras:
             continue
         if k % 50 == 0:
             print(f"  analizando {k}/{len(tickers)}...")
@@ -1555,6 +1685,20 @@ def main():
             f.write(ficha(r, cfg) + "\n")
     with open(os.path.join(args.salida, "avisos.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(avisos) or "(sin avisos)")
+    compras = [r["ticker"] for r in resultados if r["dir"] == "Compra"]
+    with open(os.path.join(args.salida, "compras.txt"), "w", encoding="utf-8") as f:
+        f.write(",".join(t.replace("-", ".") for t in compras))
+    filas = []
+    for t in tickers:
+        d = datos.get(t)
+        if d is None or not len(d):
+            filas.append({"Ticker": t, "Primera": "", "Ultima": "", "Barras": 0, "Dias atraso": np.nan,
+                          "Estado": "sin datos"})
+            continue
+        est = "sin barras nuevas" if t in sin_barras else "historia corta" if len(d) < MIN_BARRAS_D else "ok"
+        filas.append({"Ticker": t, "Primera": d.index[0].date(), "Ultima": d.index[-1].date(),
+                      "Barras": len(d), "Dias atraso": (ref - d.index[-1]).days, "Estado": est})
+    pd.DataFrame(filas).to_csv(os.path.join(args.salida, "estado_datos.csv"), index=False)
 
     # --- PDF
     if not args.sin_pdf:
@@ -1563,6 +1707,37 @@ def main():
                 print(f"Grafico {i}/{len(sel)}: {r['ticker']}")
                 for tf in ("D", "W"):
                     dibujar(pdf, r, tf, cfg)
+
+    if args.telegram or args.telegram_simular:
+        ruta_est = os.path.join(args.cache, "estado_compras.json")
+        previo = None
+        if os.path.exists(ruta_est):
+            try:
+                previo = json.load(open(ruta_est, encoding="utf-8"))
+            except Exception:
+                previo = None
+        msg = mensaje_telegram(resultados, previo, resultados[0]["fecha"], args.telegram_siempre)
+        guardar = False
+        if msg is None:
+            print("Telegram: sin cambios en las compras; no se envia")
+            guardar = True
+        elif args.telegram_simular:
+            print("--- Telegram (simulado) ---\n" + msg + "\n---")
+        else:
+            tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+            if not tok or not chat:
+                print("Telegram: faltan TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID; no se envia")
+            else:
+                try:
+                    enviar_telegram(msg, tok, chat)
+                    print("Telegram: mensaje enviado")
+                    guardar = True
+                except Exception as e:  # noqa
+                    print(f"Telegram: error al enviar ({type(e).__name__}); se reintentara en la proxima ejecucion")
+        if guardar and not args.telegram_simular:
+            os.makedirs(args.cache, exist_ok=True)
+            with open(ruta_est, "w", encoding="utf-8") as f:
+                json.dump({"fecha": str(resultados[0]["fecha"].date()), "compras": compras}, f)
 
     print(f"\nListo. {len(resultados)} analizados, {len(sel)} en PDF/fichas. Resultados en: {os.path.abspath(args.salida)}")
     print("Ranking: " + ", ".join(f"{r['ticker']}({r['dir'][0]}{r['score']})" for r in resultados[:10]))
