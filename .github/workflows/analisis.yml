@@ -1,9 +1,12 @@
+# Copiar a .github/workflows/analisis.yml
+# Secrets opcionales (Settings > Secrets and variables > Actions):
+#   TELEGRAM_BOT_TOKEN  (token que te da @BotFather)
+#   TELEGRAM_CHAT_ID    (tu chat id)
 name: Analisis tecnico
 on:
   schedule:
-    - cron: "45 21 * * 1-5"
+    - cron: "45 21 * * 1-5"   # 21:45 UTC = despues del cierre de EE. UU. (verano e invierno)
   workflow_dispatch:
-
 jobs:
   analisis:
     runs-on: ubuntu-latest
@@ -12,16 +15,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
       - run: pip install -r requirements.txt
       - name: Restaurar cache de datos
         uses: actions/cache@v4
         with:
           path: cache
-          key: "datos-${{ github.run_id }}"
-          restore-keys: |
-            datos-
-      - run: python generador_graficos.py --salida resultados
+          key: datos-${{ github.run_id }}
+          restore-keys: datos-
+      - name: Analisis
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python generador_graficos.py --salida resultados --telegram
       - uses: actions/upload-artifact@v4
         with:
           name: resultados
