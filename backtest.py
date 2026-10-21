@@ -6,16 +6,24 @@ backtest.py
 Backtest de las reglas del generador (etapa 2 de Weinstein + RS Mansfield > 0 +
 ruptura de base con volumen) sin mirar al futuro.
 
-Compara 5 variantes para ver cuanto aporta cada filtro:
-  1. Ruptura sola
-  2. Ruptura + volumen
-  3. Etapa 2 + RS>0 (entrada cuando se activa)
-  4. Etapa 2 + RS>0 + ruptura
-  5. COMPLETO: etapa 2 + RS>0 + ruptura + volumen
+Compara 10 variantes para ver cuanto aporta cada filtro:
+  1-5. Ruptura sola / + volumen / Etapa 2 + RS>0 / + ruptura / COMPLETO
+  6.   Estado + mercado (S&P 500 en etapa 2)
+  7.   Estado + etapa joven (<= 12 semanas en etapa 2)
+  8.   Estado + no extendida (<= 15% sobre la SMA30 semanal)
+  9.   Estado + RS creciente (RS actual > RS de hace 4 semanas)
+  10.  Combinado de 6, 7, 8 y 9
+("Estado" = etapa 2 + RS>0; entra cuando la condicion se activa)
 
-Y dos formas de salir:
-  - trailing: cierre semanal bajo la SMA30 (estilo Weinstein) o stop inicial
-  - objetivo: altura de la base proyectada sobre el techo, o stop inicial (max. 120 barras)
+Salida principal: trailing (cierre semanal bajo la SMA30, estilo Weinstein) o stop inicial.
+Con --con-objetivo tambien prueba la salida por altura de base proyectada.
+
+Ademas simula una CARTERA con tu tamaño real (riesgo por operacion, tope por posicion,
+sin apalancamiento) y la compara con comprar y mantener el S&P 500.
+
+CUIDADO CON EL SOBREAJUSTE: probar muchas variantes sobre los mismos datos siempre
+encuentra alguna que "funciona". Elige con la mitad anterior a --corte y comprueba
+que se mantiene en la mitad posterior.
 
 Reglas de ejecucion (sin lookahead): la señal se calcula al cierre; se entra en la
 apertura de la barra siguiente; stop inicial bajo el minimo de la base - 0.25 ATR
@@ -27,7 +35,8 @@ entraron lo hicieron tras subir. Los resultados salen MEJORES de lo que habria d
 operar entonces. Usalos para comparar variantes entre si, no como rentabilidad esperada.
 
 Uso:
-  python backtest.py                         # tickers.txt o S&P 500, 10 años, cache_bt/
+  python backtest.py --sp500                 # S&P 500 actual, 10 años, cache_bt/
+  python backtest.py                         # tickers.txt (o S&P 500 si esta vacio)
   python backtest.py --tickers AAPL,MSFT --años 10
   python backtest.py --solo-cache            # sin red
 """
@@ -46,12 +55,15 @@ import generador_graficos as g
 
 L_BASE, PROF_MAX, VOL_MIN, COOLDOWN = 40, 0.16, 1.5, 20
 VARIANTES = ["Ruptura sola", "Ruptura + volumen", "Etapa 2 + RS>0 (al activarse)",
-             "Etapa 2 + RS>0 + ruptura", "COMPLETO: etapa 2 + RS>0 + ruptura + volumen"]
+             "Etapa 2 + RS>0 + ruptura", "COMPLETO: etapa 2 + RS>0 + ruptura + volumen",
+             "Estado + mercado en etapa 2", "Estado + etapa joven (<=12 sem)",
+             "Estado + no extendida (<=15%)", "Estado + RS creciente (4 sem)",
+             "Combinado: mercado + RS creciente + joven + no extendida"]
 CON_RUPTURA = [v for v in VARIANTES if "uptura" in v]
 HS = (20, 60)
 
 
-def preparar_serie(raw, bench_w):
+def preparar_serie(raw, bench_w, et_mkt):
     """Señales y auxiliares, todo calculado solo con informacion disponible en cada fecha."""
     dd = g.preparar(raw)
     dw, _ = g.semanal(dd)
@@ -68,12 +80,29 @@ def preparar_serie(raw, bench_w):
     vr = v / v.shift(1).rolling(50).mean()
     ruptura = (c > prev_max) & (prof <= PROF_MAX)
     estado = (etapa_d == 2) & (rs_d > 0)
+    m30_d = m30.reindex(idx, method="ffill")
+    dist = (c / m30_d - 1) * 100
+    edad = et.groupby((et != et.shift()).cumsum()).cumcount() + 1
+    joven = edad.reindex(idx, method="ffill") <= 12
+    noext = dist <= 15
+    rs_up = (rs > rs.shift(4)).astype(float).reindex(idx, method="ffill") == 1
+    mkt = et_mkt.reindex(idx, method="ffill") == 2
+
+    def act(x):
+        x = x.fillna(False).astype(bool)
+        return x & ~x.shift(1, fill_value=False)
+
     S = {
         VARIANTES[0]: ruptura,
         VARIANTES[1]: ruptura & (vr >= VOL_MIN),
-        VARIANTES[2]: estado & ~estado.shift(1, fill_value=False),
+        VARIANTES[2]: act(estado),
         VARIANTES[3]: estado & ruptura,
         VARIANTES[4]: estado & ruptura & (vr >= VOL_MIN),
+        VARIANTES[5]: act(estado & mkt),
+        VARIANTES[6]: act(estado & joven),
+        VARIANTES[7]: act(estado & noext),
+        VARIANTES[8]: act(estado & rs_up),
+        VARIANTES[9]: act(estado & mkt & rs_up & joven & noext),
     }
     S = {k: x.fillna(False).astype(bool) for k, x in S.items()}
     below = (dw["Close"] < m30) & m30.notna()
@@ -203,38 +232,123 @@ def tabla_md(df):
     return "\n".join([cab, sep] + filas)
 
 
+def simular_cartera(tr, closes, bench_close, cuenta, riesgo, max_pos, seed=0):
+    """Cartera con tu tamaño real: acciones = min(riesgo/(entrada-stop), max_pos/entrada),
+    sin apalancamiento (si no hay caja, se omite la operacion). Valora a mercado cada dia."""
+    if tr.empty:
+        return None
+    rng = np.random.default_rng(seed)
+    tr = tr.copy()
+    tr["_o"] = rng.random(len(tr))
+    tr = tr.sort_values(["fecha_entrada", "_o"])
+    dias = bench_close.index[(bench_close.index >= tr["fecha_entrada"].min())
+                             & (bench_close.index <= tr["fecha_salida"].max())]
+    tick = sorted(tr["Ticker"].unique())
+    px = pd.DataFrame({t: closes[t] for t in tick}).reindex(dias).ffill()
+    por_dia = {d: g_.to_dict("records") for d, g_ in tr.groupby("fecha_entrada")}
+    abiertas, cerradas, omitidas = [], [], 0
+    cash = float(cuenta)
+    eq, inv = [], []
+
+    def cerrar(d):
+        nonlocal cash
+        for p in [p for p in abiertas if p["fecha_salida"] <= d]:
+            cash += p["acc"] * p["salida"]
+            cerradas.append((p["acc"] * (p["salida"] - p["entrada"]), p["acc"] * p["entrada"]))
+            abiertas.remove(p)
+
+    for d in dias:
+        cerrar(d)
+        for t in por_dia.get(d, []):
+            r_acc = t["entrada"] - t["stop"]
+            acc = int(min(riesgo // r_acc, max_pos // t["entrada"]))
+            if acc < 1:
+                continue
+            if acc * t["entrada"] > cash:
+                omitidas += 1
+                continue
+            cash -= acc * t["entrada"]
+            abiertas.append({**t, "acc": acc})
+        cerrar(d)
+        val = sum(p["acc"] * px.at[d, p["Ticker"]] for p in abiertas)
+        eq.append(cash + val)
+        inv.append(val / (cash + val) if cash + val > 0 else np.nan)
+    eq = pd.Series(eq, index=dias)
+    años = max((dias[-1] - dias[0]).days / 365.25, 1e-9)
+    dd = eq / eq.cummax() - 1
+    bajo = (dd < -1e-9).astype(int)
+    racha, mejor, ini = 0, 0, None
+    for d, b in bajo.items():
+        if b:
+            ini = ini or d
+            mejor = max(mejor, (d - ini).days)
+        else:
+            ini = None
+    pnl = np.array([c[0] for c in cerradas])
+    gan, per = pnl[pnl > 0].sum(), -pnl[pnl <= 0].sum()
+    bc = bench_close.reindex(dias).ffill()
+    bdd = bc / bc.cummax() - 1
+    return {"eq": eq, "dd": dd,
+            "res": {"Operaciones tomadas": len(cerradas), "Omitidas (sin caja)": omitidas,
+                    "Ganadoras %": round((pnl > 0).mean() * 100, 1) if len(pnl) else np.nan,
+                    "Factor beneficio $": round(gan / per, 2) if per > 0 else np.nan,
+                    "CAGR %": round(((eq.iloc[-1] / cuenta) ** (1 / años) - 1) * 100, 1),
+                    "DD max %": round(dd.min() * 100, 1),
+                    "Racha bajo maximos (años)": round(mejor / 365.25, 1),
+                    "Capital invertido medio %": round(float(np.nanmean(inv)) * 100, 0),
+                    "Cuenta final $": round(eq.iloc[-1]),
+                    "S&P 500 CAGR %": round(((bc.iloc[-1] / bc.iloc[0]) ** (1 / años) - 1) * 100, 1),
+                    "S&P 500 DD max %": round(bdd.min() * 100, 1)}}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tickers")
     ap.add_argument("--archivo", default="tickers.txt")
+    ap.add_argument("--sp500", action="store_true", help="Ignora tickers.txt y usa el S&P 500 actual")
     ap.add_argument("--cache", default="cache_bt")
     ap.add_argument("--salida", default="resultados_backtest")
     ap.add_argument("--años", type=int, default=10)
     ap.add_argument("--solo-cache", action="store_true")
     ap.add_argument("--coste", type=float, default=0.0005, help="Deslizamiento por lado (0.0005 = 0.05%)")
+    ap.add_argument("--corte", default="2022-01-01", help="Fecha que separa las dos mitades")
+    ap.add_argument("--con-objetivo", action="store_true", help="Prueba tambien la salida por altura de base")
+    ap.add_argument("--cuenta", type=float, default=100000)
+    ap.add_argument("--riesgo", type=float, default=800, help="Riesgo maximo por operacion en dinero")
+    ap.add_argument("--max-pos", type=float, default=5000)
+    ap.add_argument("--semilla", type=int, default=0, help="Desempate aleatorio de entradas el mismo dia")
     args = ap.parse_args()
     os.makedirs(args.salida, exist_ok=True)
+    corte = pd.Timestamp(args.corte)
 
-    txt = ""
-    if args.archivo and os.path.exists(args.archivo):
-        txt = open(args.archivo, encoding="utf-8").read()
-    tickers = g.parse_tickers((args.tickers or "") + "," + txt)
+    tickers = []
+    if not args.sp500:
+        txt = ""
+        if args.archivo and os.path.exists(args.archivo):
+            txt = open(args.archivo, encoding="utf-8").read()
+        tickers = g.parse_tickers((args.tickers or "") + "," + txt)
     if not tickers:
         p = os.path.join(args.cache, "sp500.csv")
-        sp = pd.read_csv(p) if args.solo_cache and os.path.exists(p) else (None if args.solo_cache else g.cargar_sp500(args.cache))
+        sp = (pd.read_csv(p) if os.path.exists(p) else None) if args.solo_cache else g.cargar_sp500(args.cache)
         if sp is None:
             sys.exit("Sin tickers y sin lista del S&P 500.")
         tickers = list(dict.fromkeys(sp["Ticker"].tolist()))
         print(f"Universo: S&P 500 actual ({len(tickers)} tickers)")
+    else:
+        print(f"Universo: {len(tickers)} tickers de la lista (no es el S&P 500 completo)")
     datos, avisos = g.actualizar_cache(tickers + [g.BENCH], args.cache, args.años, False, args.solo_cache)
     avisos += g.descartar_provisional(datos, args.cache)
     if g.BENCH not in datos:
-        sys.exit("Falta ^GSPC en la cache: se necesita para el RS Mansfield.")
-    bench_w = datos[g.BENCH]["Close"].resample("W-FRI").last().dropna()
+        sys.exit("Falta ^GSPC en la cache: se necesita para el RS Mansfield y el filtro de mercado.")
+    bench_close = datos[g.BENCH]["Close"]
+    bench_w = bench_close.resample("W-FRI").last().dropna()
+    et_mkt, _, _ = g.etapas_serie(pd.DataFrame({"Close": bench_w}))
 
-    trades = {(v, m): [] for v in VARIANTES for m in ("trailing", "objetivo") if m == "trailing" or v in CON_RUPTURA}
+    modos = {v: ["trailing"] + (["objetivo"] if args.con_objetivo and v in CON_RUPTURA else []) for v in VARIANTES}
+    trades = {(v, m): [] for v in VARIANTES for m in modos[v]}
     fwd = {v: {h: [] for h in HS} for v in VARIANTES}
     base = {h: [] for h in HS}
+    closes = {}
     usados, ini, fin = 0, None, None
     for k, t in enumerate(tickers, 1):
         if t not in datos or len(datos[t]) < 400:
@@ -242,11 +356,12 @@ def main():
         if k % 100 == 0:
             print(f"  {k}/{len(tickers)}")
         try:
-            P = preparar_serie(datos[t], bench_w)
+            P = preparar_serie(datos[t], bench_w, et_mkt)
         except Exception as e:  # noqa
             avisos.append(f"{t}: error ({type(e).__name__}: {e})")
             continue
         usados += 1
+        closes[t] = P["dd"]["Close"]
         val = np.flatnonzero(P["valido"])
         if len(val):
             a, b = P["dd"].index[val[0]], P["dd"].index[-1]
@@ -270,6 +385,11 @@ def main():
     filas = []
     for (v, m), trs in trades.items():
         f = {"Variante": v, "Salida": m, **resumen(trs)}
+        if trs:
+            d = pd.DataFrame(trs)
+            a_, b_ = d[d["fecha_entrada"] < corte]["R"], d[d["fecha_entrada"] >= corte]["R"]
+            f["R antes corte"], f["n antes"] = round(a_.mean(), 2) if len(a_) else np.nan, len(a_)
+            f["R desde corte"], f["n desde"] = round(b_.mean(), 2) if len(b_) else np.nan, len(b_)
         f["Señales (20b entre ellas)"] = len(fwd[v][20])
         for h in HS:
             x = fwd[v][h]
@@ -280,45 +400,86 @@ def main():
         df[f"Base +{h}b %"] = round(base[h], 1)
     df.to_csv(os.path.join(args.salida, "backtest_resumen.csv"), index=False, encoding="utf-8-sig")
     todos = [t for trs in trades.values() for t in trs]
-    pd.DataFrame(todos).drop(columns=["k_out"]).to_csv(os.path.join(args.salida, "backtest_trades.csv"), index=False)
+    tdf = pd.DataFrame(todos)
+    tdf.drop(columns=["k_out"]).to_csv(os.path.join(args.salida, "backtest_trades.csv"), index=False)
 
-    comp = trades[(VARIANTES[4], "trailing")]
+    # --- Cartera
+    carteras, filas_c = {}, []
+    for v in VARIANTES:
+        sub = tdf[(tdf["Variante"] == v) & (tdf["Salida"] == "trailing")] if len(tdf) else tdf
+        c_ = simular_cartera(sub, closes, bench_close, args.cuenta, args.riesgo, args.max_pos, args.semilla)
+        if c_:
+            carteras[v] = c_
+            filas_c.append({"Variante": v, **c_["res"]})
+    dfc = pd.DataFrame(filas_c)
+    if len(dfc):
+        dfc.to_csv(os.path.join(args.salida, "backtest_cartera.csv"), index=False, encoding="utf-8-sig")
+        fig, ax = plt.subplots(2, 1, figsize=(11, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]})
+        sel = [v for v in (VARIANTES[4], VARIANTES[2], VARIANTES[5], VARIANTES[9]) if v in carteras]
+        for v in sel:
+            ax[0].plot(carteras[v]["eq"], lw=1.3, label=v[:42])
+            ax[1].plot(carteras[v]["dd"] * 100, lw=1.0)
+        e0 = carteras[sel[0]]["eq"]
+        bc = bench_close.reindex(e0.index).ffill()
+        ax[0].plot(bc / bc.iloc[0] * args.cuenta, color="grey", lw=1.3, ls="--", label="S&P 500 (comprar y mantener)")
+        ax[0].set_title(f"Cartera simulada: {args.riesgo:.0f} de riesgo, max {args.max_pos:.0f} por posicion, sin apalancamiento")
+        ax[0].legend(fontsize=8)
+        ax[0].grid(alpha=0.3)
+        ax[1].set_ylabel("Caida desde maximo %")
+        ax[1].grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.salida, "backtest_cartera.png"), dpi=110)
+        plt.close(fig)
+
+    # --- Grafico de R (estado) y por año
+    ref = VARIANTES[2]
+    d_ref = tdf[(tdf["Variante"] == ref) & (tdf["Salida"] == "trailing")] if len(tdf) else tdf
     por_año = pd.DataFrame()
-    if comp:
-        d = pd.DataFrame(comp)
+    if len(d_ref):
+        d = d_ref.copy()
         d["Año"] = d["fecha_entrada"].dt.year
         por_año = d.groupby("Año").agg(Trades=("R", "size"), **{"R medio": ("R", "mean")},
                                        **{"Ganadoras %": ("R", lambda x: (x > 0).mean() * 100)}).round(2).reset_index()
-        if len(d) >= 5:
-            fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-            ax[0].hist(d["R"].clip(-3, 10), bins=30, color="#2e7d32", alpha=0.8)
-            ax[0].axvline(0, color="k", lw=0.8)
-            ax[0].set_title("Distribucion de R (COMPLETO, trailing)")
-            ds = d.sort_values("fecha_salida")
-            ax[1].plot(ds["fecha_salida"], ds["R"].cumsum(), color="#1f4e79")
-            ax[1].set_title("R acumulado por fecha de salida (trades solapados)")
-            ax[1].grid(alpha=0.3)
-            fig.tight_layout()
-            fig.savefig(os.path.join(args.salida, "backtest_R.png"), dpi=110)
-            plt.close(fig)
+        fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+        ax[0].hist(d["R"].clip(-3, 10), bins=30, color="#2e7d32", alpha=0.8)
+        ax[0].axvline(0, color="k", lw=0.8)
+        ax[0].set_title("Distribucion de R (Estado, trailing)")
+        ds = d.sort_values("fecha_salida")
+        ax[1].plot(ds["fecha_salida"], ds["R"].cumsum(), color="#1f4e79")
+        ax[1].set_title("R acumulado (trades solapados, sin tamaño)")
+        ax[1].grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.salida, "backtest_R.png"), dpi=110)
+        plt.close(fig)
 
     md = ["# Backtest de las reglas", "",
-          f"- Periodo con señales validas: {ini:%Y-%m-%d} a {fin:%Y-%m-%d}; {usados} tickers.",
+          f"- Periodo con señales validas: {ini:%Y-%m-%d} a {fin:%Y-%m-%d}; {usados} tickers"
+          + ("" if len(tickers) > 400 else " (NO es el S&P 500 completo)") + ".",
           f"- Deslizamiento: {args.coste * 100:.2f}% por lado. Precios sin ajustar por dividendos.",
-          "- **Sesgo de supervivencia:** universo = S&P 500 actual; faltan las empresas que salieron del indice. "
+          "- **Sesgo de supervivencia:** universo = componentes ACTUALES; faltan las empresas que salieron del indice. "
           "Los resultados estan inflados: sirven para comparar variantes, no como rentabilidad esperada.",
-          "- Los trades no son independientes (las rupturas se concentran en fases alcistas del mercado), "
-          "asi que el t-stat sobreestima la significancia.",
-          "- `Base +Nb %` es el retorno medio de entrar cualquier dia valido (sin señal) a N barras.", "",
-          "## Resumen", "", tabla_md(df), ""]
+          "- **Sobreajuste:** se prueban 10 variantes sobre los mismos datos. Elige con la mitad anterior al corte "
+          f"({corte:%Y-%m-%d}) y exige que se mantenga en la posterior.",
+          "- Los trades no son independientes (las rupturas se concentran en fases alcistas): el t-stat sobreestima.",
+          "- `Base +Nb %` = retorno medio de entrar cualquier dia valido (sin señal) a N barras.", "",
+          "## Operaciones (R = ganancia / riesgo inicial)", "", tabla_md(df), ""]
+    if len(dfc):
+        md += ["## Cartera con tu tamaño real", "", tabla_md(dfc), ""]
     if len(por_año):
-        md += ["## COMPLETO (trailing) por año de entrada", "", tabla_md(por_año), ""]
+        md += ["## Estado (etapa 2 + RS>0, trailing) por año de entrada", "", tabla_md(por_año), ""]
     open(os.path.join(args.salida, "backtest.md"), "w", encoding="utf-8").write("\n".join(md))
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", 30)
-    print(df.drop(columns=["Barras medias", "% stop", "% salida por regla", "% abierta/tiempo"], errors="ignore").to_string(index=False))
+    cols = ["Variante", "Salida", "Trades", "R medio", "Factor beneficio", "t-stat R", "R antes corte", "n antes",
+            "R desde corte", "n desde"]
+    print(df[[c for c in cols if c in df.columns]].to_string(index=False))
+    if len(dfc):
+        print()
+        print(dfc[["Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %", "DD max %",
+                   "Racha bajo maximos (años)", "Capital invertido medio %", "S&P 500 CAGR %",
+                   "S&P 500 DD max %"]].to_string(index=False))
     print(f"\nPeriodo {ini:%Y-%m-%d} a {fin:%Y-%m-%d}, {usados} tickers. Resultados en {os.path.abspath(args.salida)}")
-    print("AVISO: sesgo de supervivencia (S&P 500 actual); comparar variantes, no tomar como rentabilidad esperada.")
+    print("AVISO: sesgo de supervivencia y riesgo de sobreajuste: comparar variantes, no tomar como rentabilidad esperada.")
 
 
 if __name__ == "__main__":
