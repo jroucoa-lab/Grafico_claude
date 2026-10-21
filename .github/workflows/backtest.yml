@@ -1,0 +1,28 @@
+# Copiar a .github/workflows/backtest.yml  (se lanza a mano desde la pestaña Actions)
+name: Backtest
+on:
+  workflow_dispatch:
+    inputs:
+      anios:
+        description: "Años de historico"
+        default: "10"
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: cache_bt
+          key: datos-bt-${{ github.run_id }}
+          restore-keys: datos-bt-
+      - run: python backtest.py --años ${{ github.event.inputs.anios }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backtest
+          path: resultados_backtest
