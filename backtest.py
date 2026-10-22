@@ -28,6 +28,11 @@ sin apalancamiento) y la compara con comprar y mantener el S&P 500. Cuando varia
 coinciden el mismo dia y no hay caja para todas, se prioriza por RS Mansfield (y se mide
 el ruido repitiendo con --semillas desempates aleatorios).
 
+PRUEBA SIN LIMITE DE CAJA (backtest_sin_limite.csv): cartera equiponderada de TODAS las acciones
+que cumplen la condicion cada dia (sin las 20 posiciones ni los desempates) frente a la de
+todas las acciones. Es la forma mas limpia de ver si estar en etapa 2 con RS>0 aporta algo.
+Incluye etapa 4 como contraste (deberia rendir peor que "todas") y una comparacion con IC95%.
+
 CUIDADO CON EL SOBREAJUSTE: probar muchas variantes sobre los mismos datos siempre
 encuentra alguna que "funciona". Elige con la mitad anterior a --corte y comprueba
 que se mantiene en la mitad posterior.
@@ -102,6 +107,12 @@ def preparar_serie(raw, bench_w, et_mkt, seed=0, ticker=""):
         x = x.fillna(False).astype(bool)
         return x & ~x.shift(1, fill_value=False)
 
+    E = {"Estado (etapa 2 + RS>0)": estado,
+         "Etapa 2 sola": (etapa_d == 2),
+         "Estado + no extendida (<=15%)": estado & noext,
+         "Estado + mercado en etapa 2": estado & mkt,
+         "Etapa 4 (contraste)": (etapa_d == 4)}
+    E = {k: x.fillna(False).astype(bool) for k, x in E.items()}
     S = {
         VARIANTES[0]: ruptura,
         VARIANTES[1]: ruptura & (vr >= VOL_MIN),
@@ -126,7 +137,8 @@ def preparar_serie(raw, bench_w, et_mkt, seed=0, ticker=""):
             if len(sub):
                 salida.loc[sub[-1]] = True
     return {"dd": dd, "S": S, "atr": g.atr(h, l, c), "pmin": prev_min, "pmax": prev_max,
-            "salida": salida.values, "rs": rs_d.values, "valido": (etapa_d.notna() & rs_d.notna()).values}
+            "salida": salida.values, "rs": rs_d.values, "valido": (etapa_d.notna() & rs_d.notna()).values,
+            "E": E, "valido_s": (etapa_d.notna() & rs_d.notna())}
 
 
 def operar(P, i, modo, slip):
@@ -336,6 +348,30 @@ def equiponderado(px):
     return out
 
 
+def cartera_sin_limite(ret, cond, coste):
+    """Cartera equiponderada de las acciones con cond=True al cierre de t-1 (se mantienen durante t).
+    Rebalanceo diario; sin miembros = caja. Descuenta coste por lado sobre la rotacion."""
+    w = cond.shift(1, fill_value=False) & ret.notna()
+    n = w.sum(axis=1)
+    r = ret.where(w).sum(axis=1) / n.replace(0, np.nan)
+    r = r.fillna(0.0)
+    peso = w.div(n.replace(0, np.nan), axis=0).fillna(0.0)
+    turn = (peso - peso.shift(1).fillna(0.0)).abs().sum(axis=1)
+    r_net = r - turn * coste
+    return r_net, n, turn
+
+
+def exceso_ic(r_a, r_b, n=3000, seed=0):
+    """Exceso diario medio de A sobre B anualizado, con IC95% remuestreando meses."""
+    d = (r_a - r_b).dropna()
+    mes = d.index.to_period("M")
+    g_ = d.groupby(mes).agg(["sum", "count"])
+    idx = np.random.default_rng(seed).integers(0, len(g_), (n, len(g_)))
+    m = g_["sum"].values[idx].sum(1) / g_["count"].values[idx].sum(1) * 252 * 100
+    lo, hi = np.percentile(m, [2.5, 97.5])
+    return d.mean() * 252 * 100, lo, hi
+
+
 def cagr_ventana(eq, a, b):
     """CAGR (%) y caida maxima (%) de la curva de cuenta entre a y b, reiniciando el capital en a."""
     x = eq[(eq.index >= a) & (eq.index < b)]
@@ -414,6 +450,8 @@ def main():
     fwd = {v: {h: [] for h in HS} for v in VARIANTES}
     base = {h: [] for h in HS}
     closes = {}
+    cond_cols = {}
+    valid_cols = {}
     usados, ini, fin = 0, None, None
     for k, t in enumerate(tickers, 1):
         if t not in datos or len(datos[t]) < 400:
@@ -427,6 +465,9 @@ def main():
             continue
         usados += 1
         closes[t] = P["dd"]["Close"]
+        valid_cols[t] = P["valido_s"]
+        for nom_c, ser_c in P["E"].items():
+            cond_cols.setdefault(nom_c, {})[t] = ser_c & P["valido_s"]
         val = np.flatnonzero(P["valido"])
         if len(val):
             a, b = P["dd"].index[val[0]], P["dd"].index[-1]
@@ -479,6 +520,63 @@ def main():
     # --- Cartera (prioridad por RS) y ruido con desempates aleatorios
     px_all = pd.DataFrame(closes).reindex(bench_close.index).ffill()
     ew = equiponderado(px_all)
+
+    # --- Cartera sin limite de caja: condicion vs todas las acciones
+    ret_all = px_all.pct_change()
+    idx_all = px_all.index
+    todas_m = pd.DataFrame(valid_cols).reindex(idx_all).fillna(False).astype(bool)
+    r_todas, n_todas, turn_todas = cartera_sin_limite(ret_all, todas_m, args.coste)
+    fecha_ini = idx_all[np.flatnonzero(todas_m.any(axis=1).values)[0]] if todas_m.values.any() else idx_all[0]
+    r_todas = r_todas[r_todas.index >= fecha_ini]
+    años_t = (r_todas.index[-1] - r_todas.index[0]).days / 365.25
+    ventanas_sl = [(f"antes {corte:%Y-%m}", pd.Timestamp.min, corte), (f"desde {corte:%Y-%m}", corte, pd.Timestamp.max),
+                   (f"hasta {pd.Timestamp(args.sin_tramo_desde):%Y-%m}", pd.Timestamp.min, pd.Timestamp(args.sin_tramo_desde))]
+
+    def fila_sl(nombre, r_net, n, turn, es_base=False):
+        r_net, n, turn = (x[x.index >= fecha_ini] for x in (r_net, n, turn))
+        eq = (1 + r_net).cumprod()
+        f = {"Cartera": nombre,
+             "CAGR %": round(((eq.iloc[-1]) ** (1 / años_t) - 1) * 100, 1),
+             "DD max %": round((eq / eq.cummax() - 1).min() * 100, 1)}
+        for nom, a, b in ventanas_sl:
+            f[f"CAGR {nom}"] = round(cagr_ventana(eq, a, b)[0], 1)
+        f["% del tiempo invertida"] = round((n > 0).mean() * 100, 0)
+        f["Acciones medias"] = round(float(n[n > 0].mean()), 0) if (n > 0).any() else np.nan
+        f["Rotacion anual (x cartera)"] = round(float(turn.sum() / años_t), 1)
+        if not es_base:
+            ex, lo, hi = exceso_ic(r_net, r_todas)
+            act = n > 0
+            f["Exceso anual vs todas %"] = round(ex, 1)
+            f["IC95 exceso"] = f"[{lo:.1f}, {hi:.1f}]"
+            f["Exceso solo dias invertida %"] = round(float((r_net - r_todas)[act].mean() * 252 * 100), 1)
+            f["Veredicto"] = "SUPERA" if lo > 0 else ("PEOR" if hi < 0 else "no se distingue")
+        return f, eq
+
+    filas_sl, eqs_sl = [], {}
+    f0, eq0 = fila_sl("TODAS las acciones (equiponderada diaria)", r_todas, n_todas, turn_todas, True)
+    filas_sl.append(f0)
+    eqs_sl["Todas"] = eq0
+    for nom_c, cols_c in cond_cols.items():
+        cm = pd.DataFrame(cols_c).reindex(idx_all).fillna(False).astype(bool)
+        r_c, n_c, t_c = cartera_sin_limite(ret_all, cm, args.coste)
+        f, eqc = fila_sl(nom_c, r_c, n_c, t_c)
+        filas_sl.append(f)
+        eqs_sl[nom_c] = eqc
+    dfs = pd.DataFrame(filas_sl)
+    dfs.to_csv(os.path.join(args.salida, "backtest_sin_limite.csv"), index=False, encoding="utf-8-sig")
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    for k, v_ in eqs_sl.items():
+        if k in ("Todas", "Estado (etapa 2 + RS>0)", "Etapa 2 sola", "Etapa 4 (contraste)", "Estado + mercado en etapa 2"):
+            ax.plot(v_ / v_.iloc[0] * args.cuenta, lw=1.3, label=k)
+    bs = bench_close.reindex(eqs_sl["Todas"].index).ffill()
+    ax.plot(bs / bs.iloc[0] * args.cuenta, color="grey", ls="--", lw=1.2, label="S&P 500")
+    ax.set_yscale("log")
+    ax.set_title("Sin limite de caja: equiponderada de las acciones que cumplen la condicion (escala log)")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(args.salida, "backtest_sin_limite.png"), dpi=110)
+    plt.close(fig)
     carteras, filas_c = {}, []
     for v in VARIANTES:
         sub = tdf[(tdf["Variante"] == v) & (tdf["Salida"] == "trailing")] if len(tdf) else tdf
@@ -585,6 +683,10 @@ def main():
           "## Operaciones (R = ganancia / riesgo inicial)", "", tabla_md(df), ""]
     if len(dfd):
         md += ["## Diferencia de R frente al control (IC95% agrupado por mes)", "", tabla_md(dfd), ""]
+    md += ["## Prueba sin limite de caja (equiponderada diaria, coste incluido)", "",
+           "Cada dia se mantiene a partes iguales las acciones que cumplian la condicion al cierre anterior; sin ninguna, caja. "
+           "`Exceso` = diferencia con la cartera de TODAS las acciones, con IC95% remuestreando meses. "
+           "Etapa 4 es un contraste: si la clasificacion sirve, debe rendir peor que todas.", "", tabla_md(dfs), ""]
     if len(dfm):
         md += ["## CAGR por mitades (cada ventana reinicia el capital)", "",
                f"`antes/desde {corte:%Y-%m}` = dos mitades; `hasta {excl:%Y-%m}` = sin el tramo final. "
@@ -606,6 +708,9 @@ def main():
     if len(dfd):
         print()
         print(dfd.to_string(index=False))
+    print()
+    print(dfs[["Cartera", "CAGR %", "DD max %", "% del tiempo invertida", "Acciones medias", "Exceso anual vs todas %",
+               "IC95 exceso", "Veredicto"] if "Veredicto" in dfs.columns else ["Cartera", "CAGR %"]].to_string(index=False))
     if len(dfm):
         print()
         print(dfm.to_string(index=False))
