@@ -245,7 +245,7 @@ def tabla_md(df):
     return "\n".join([cab, sep] + filas)
 
 
-def simular_cartera(tr, px, bench_close, cuenta, riesgo, max_pos, seed=0, prioridad="aleatorio"):
+def simular_cartera(tr, px, bench_close, cuenta, riesgo, max_pos, seed=0, prioridad="aleatorio", ew=None):
     """Cartera con tu tamaño real: acciones = min(riesgo/(entrada-stop), max_pos/entrada),
     sin apalancamiento (si no hay caja, se omite la operacion). Valora a mercado cada dia.
     prioridad: con varias entradas el mismo dia, 'rs' = mayor RS Mansfield primero; 'aleatorio'."""
@@ -300,6 +300,11 @@ def simular_cartera(tr, px, bench_close, cuenta, riesgo, max_pos, seed=0, priori
     gan, per = pnl[pnl > 0].sum(), -pnl[pnl <= 0].sum()
     bc = bench_close.reindex(dias).ffill()
     bdd = bc / bc.cummax() - 1
+    extra = {}
+    if ew is not None:
+        ec = ew.reindex(dias).ffill()
+        extra = {"Equipond. CAGR %": round(((ec.iloc[-1] / ec.iloc[0]) ** (1 / años) - 1) * 100, 1),
+                 "Equipond. DD max %": round((ec / ec.cummax() - 1).min() * 100, 1)}
     return {"eq": eq, "dd": dd,
             "res": {"Operaciones tomadas": len(cerradas), "Omitidas (sin caja)": omitidas,
                     "Ganadoras %": round((pnl > 0).mean() * 100, 1) if len(pnl) else np.nan,
@@ -310,7 +315,25 @@ def simular_cartera(tr, px, bench_close, cuenta, riesgo, max_pos, seed=0, priori
                     "Capital invertido medio %": round(float(np.nanmean(inv)) * 100, 0),
                     "Cuenta final $": round(eq.iloc[-1]),
                     "S&P 500 CAGR %": round(((bc.iloc[-1] / bc.iloc[0]) ** (1 / años) - 1) * 100, 1),
-                    "S&P 500 DD max %": round(bdd.min() * 100, 1)}}
+                    "S&P 500 DD max %": round(bdd.min() * 100, 1), **extra}}
+
+
+def equiponderado(px):
+    """Indice equiponderado de los mismos tickers (comprar y mantener, rebalanceo mensual).
+    Comparte el sesgo de supervivencia de la estrategia: es la referencia justa para medirlo."""
+    r = px.pct_change()
+    r = r.where(px.notna() & px.shift().notna())
+    out = pd.Series(np.nan, index=px.index)
+    val = 1.0
+    for _, g_ in r.groupby(px.index.to_period("M")):
+        cols = g_.columns[g_.notna().any()]
+        if len(cols) == 0:
+            out.loc[g_.index] = val
+            continue
+        path = (1 + g_[cols].fillna(0)).cumprod().mean(axis=1)
+        out.loc[g_.index] = val * path.values
+        val = out.loc[g_.index[-1]]
+    return out
 
 
 def cagr_ventana(eq, a, b):
@@ -455,10 +478,11 @@ def main():
 
     # --- Cartera (prioridad por RS) y ruido con desempates aleatorios
     px_all = pd.DataFrame(closes).reindex(bench_close.index).ffill()
+    ew = equiponderado(px_all)
     carteras, filas_c = {}, []
     for v in VARIANTES:
         sub = tdf[(tdf["Variante"] == v) & (tdf["Salida"] == "trailing")] if len(tdf) else tdf
-        c_ = simular_cartera(sub, px_all, bench_close, args.cuenta, args.riesgo, args.max_pos, prioridad="rs")
+        c_ = simular_cartera(sub, px_all, bench_close, args.cuenta, args.riesgo, args.max_pos, prioridad="rs", ew=ew)
         if not c_:
             continue
         carteras[v] = c_
@@ -487,13 +511,22 @@ def main():
             for nom, a, b in ventanas:
                 f[f"CAGR {nom} {pri}"] = round(cagr_ventana(sp_eq, max(a, list(carteras.values())[0]["eq"].index[0]), b)[0], 1)
         filas_m.append(f)
+        f = {"Variante": "Equiponderado de los mismos tickers (mensual)"}
+        for pri in ("(RS)", "(aleat.)"):
+            for nom, a, b in ventanas:
+                f[f"CAGR {nom} {pri}"] = round(cagr_ventana(ew, max(a, list(carteras.values())[0]["eq"].index[0]), b)[0], 1)
+        filas_m.append(f)
     dfm = pd.DataFrame(filas_m)
     if len(dfm):
-        sp = dfm.iloc[-1]
+        sp, eqw = dfm.iloc[-2], dfm.iloc[-1]
         cols_rs = [c for c in dfm.columns if "(RS)" in c]
         dfm["Gana al S&P en las 2 mitades (RS)"] = [
             "SI" if all(r[c] > sp[c] for c in cols_rs[:2]) else "no" for _, r in dfm.iterrows()]
-        dfm.iloc[-1, dfm.columns.get_loc("Gana al S&P en las 2 mitades (RS)")] = ""
+        dfm["Gana al equipond. en las 2 mitades (RS)"] = [
+            "SI" if all(r[c] > eqw[c] for c in cols_rs[:2]) else "no" for _, r in dfm.iterrows()]
+        for k in (-2, -1):
+            dfm.iloc[k, dfm.columns.get_loc("Gana al S&P en las 2 mitades (RS)")] = ""
+            dfm.iloc[k, dfm.columns.get_loc("Gana al equipond. en las 2 mitades (RS)")] = ""
         dfm.to_csv(os.path.join(args.salida, "backtest_mitades.csv"), index=False, encoding="utf-8-sig")
     if len(dfc):
         dfc.to_csv(os.path.join(args.salida, "backtest_cartera.csv"), index=False, encoding="utf-8-sig")
@@ -505,6 +538,8 @@ def main():
         e0 = carteras[sel[0]]["eq"]
         bc = bench_close.reindex(e0.index).ffill()
         ax[0].plot(bc / bc.iloc[0] * args.cuenta, color="grey", lw=1.3, ls="--", label="S&P 500 (comprar y mantener)")
+        ec_ = ew.reindex(e0.index).ffill()
+        ax[0].plot(ec_ / ec_.iloc[0] * args.cuenta, color="black", lw=1.3, ls=":", label="Equiponderado mismos tickers")
         ax[0].set_title(f"Cartera simulada (prioridad RS): {args.riesgo:.0f} de riesgo, max {args.max_pos:.0f} por posicion")
         ax[0].legend(fontsize=8)
         ax[0].grid(alpha=0.3)
@@ -557,6 +592,8 @@ def main():
                tabla_md(dfm), ""]
     if len(dfc):
         md += ["## Cartera con tu tamaño real (prioridad por RS cuando falta caja)", "",
+               "`Equipond.` = comprar y mantener los mismos tickers a partes iguales (rebalanceo mensual): "
+               "comparte el sesgo de supervivencia, asi que lo que la estrategia gane sobre el es lo que no se explica por ese sesgo.", "",
                f"`CAGR aleat.` = {args.semillas} repeticiones con desempate aleatorio: mide cuanto del resultado es suerte.", "",
                tabla_md(dfc), ""]
     if len(por_año):
@@ -576,7 +613,7 @@ def main():
         print()
         print(dfc[["Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %", "CAGR aleat. media %",
                    "CAGR aleat. min", "CAGR aleat. max", "DD max %", "Racha bajo maximos (años)",
-                   "S&P 500 CAGR %"]].to_string(index=False))
+                   "S&P 500 CAGR %", "Equipond. CAGR %", "Equipond. DD max %"]].to_string(index=False))
     print(f"\nPeriodo {ini:%Y-%m-%d} a {fin:%Y-%m-%d}, {usados} tickers. Resultados en {os.path.abspath(args.salida)}")
     print("AVISO: sesgo de supervivencia y riesgo de sobreajuste: comparar variantes, no tomar como rentabilidad esperada.")
 
