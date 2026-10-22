@@ -54,6 +54,8 @@ jobs:
           import shutil
           prim = sorted(glob.glob("resultados_backtest/mp_*/backtest_sin_limite.csv"))[0]
           shutil.copy(prim, "resultados_backtest/sin_limite.csv")
+          prim = sorted(glob.glob("resultados_backtest/mp_*/backtest_rs_momentum.csv"))[0]
+          shutil.copy(prim, "resultados_backtest/rs_momentum.csv")
           PY
       - uses: actions/upload-artifact@v4
         with:
