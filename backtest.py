@@ -13,13 +13,20 @@ Compara 10 variantes para ver cuanto aporta cada filtro:
   8.   Estado + no extendida (<= 15% sobre la SMA30 semanal)
   9.   Estado + RS creciente (RS actual > RS de hace 4 semanas)
   10.  Combinado de 6, 7, 8 y 9
+  11.  CONTROL: entrada en dias aleatorios (misma salida y mismo stop)
+  12.  Etapa 2 sola, sin RS (para ver cuanto aporta el RS)
 ("Estado" = etapa 2 + RS>0; entra cuando la condicion se activa)
+El CONTROL responde a la pregunta clave: ¿aportan algo las entradas, o el resultado sale
+solo de la salida (stop + trailing semanal) en un mercado alcista? Se muestra la diferencia
+de R frente al control con intervalo de confianza agrupado por mes.
 
 Salida principal: trailing (cierre semanal bajo la SMA30, estilo Weinstein) o stop inicial.
 Con --con-objetivo tambien prueba la salida por altura de base proyectada.
 
 Ademas simula una CARTERA con tu tamaño real (riesgo por operacion, tope por posicion,
-sin apalancamiento) y la compara con comprar y mantener el S&P 500.
+sin apalancamiento) y la compara con comprar y mantener el S&P 500. Cuando varias señales
+coinciden el mismo dia y no hay caja para todas, se prioriza por RS Mansfield (y se mide
+el ruido repitiendo con --semillas desempates aleatorios).
 
 CUIDADO CON EL SOBREAJUSTE: probar muchas variantes sobre los mismos datos siempre
 encuentra alguna que "funciona". Elige con la mitad anterior a --corte y comprueba
@@ -43,6 +50,7 @@ Uso:
 import argparse
 import os
 import sys
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -58,12 +66,14 @@ VARIANTES = ["Ruptura sola", "Ruptura + volumen", "Etapa 2 + RS>0 (al activarse)
              "Etapa 2 + RS>0 + ruptura", "COMPLETO: etapa 2 + RS>0 + ruptura + volumen",
              "Estado + mercado en etapa 2", "Estado + etapa joven (<=12 sem)",
              "Estado + no extendida (<=15%)", "Estado + RS creciente (4 sem)",
-             "Combinado: mercado + RS creciente + joven + no extendida"]
+             "Combinado: mercado + RS creciente + joven + no extendida",
+             "CONTROL: entrada aleatoria", "Etapa 2 sola (sin RS)"]
+CONTROL = VARIANTES[10]
 CON_RUPTURA = [v for v in VARIANTES if "uptura" in v]
 HS = (20, 60)
 
 
-def preparar_serie(raw, bench_w, et_mkt):
+def preparar_serie(raw, bench_w, et_mkt, seed=0, ticker=""):
     """Señales y auxiliares, todo calculado solo con informacion disponible en cada fecha."""
     dd = g.preparar(raw)
     dw, _ = g.semanal(dd)
@@ -103,6 +113,9 @@ def preparar_serie(raw, bench_w, et_mkt):
         VARIANTES[7]: act(estado & noext),
         VARIANTES[8]: act(estado & rs_up),
         VARIANTES[9]: act(estado & mkt & rs_up & joven & noext),
+        VARIANTES[10]: pd.Series(np.random.default_rng(seed + zlib.crc32(ticker.encode())).random(len(idx)) < 0.01,
+                                 index=idx),
+        VARIANTES[11]: act(etapa_d == 2),
     }
     S = {k: x.fillna(False).astype(bool) for k, x in S.items()}
     below = (dw["Close"] < m30) & m30.notna()
@@ -113,7 +126,7 @@ def preparar_serie(raw, bench_w, et_mkt):
             if len(sub):
                 salida.loc[sub[-1]] = True
     return {"dd": dd, "S": S, "atr": g.atr(h, l, c), "pmin": prev_min, "pmax": prev_max,
-            "salida": salida.values, "valido": (etapa_d.notna() & rs_d.notna()).values}
+            "salida": salida.values, "rs": rs_d.values, "valido": (etapa_d.notna() & rs_d.notna()).values}
 
 
 def operar(P, i, modo, slip):
@@ -162,7 +175,7 @@ def operar(P, i, modo, slip):
     px_net = px * (1 - slip)
     return {"fecha_senal": dd.index[i], "fecha_entrada": dd.index[j], "entrada": entrada, "stop": stop,
             "fecha_salida": dd.index[kout], "salida": px_net, "motivo": motivo,
-            "R": (px_net - entrada) / riesgo, "ret": px_net / entrada - 1, "barras": kout - j, "k_out": kout}
+            "rs": P["rs"][i], "R": (px_net - entrada) / riesgo, "ret": px_net / entrada - 1, "barras": kout - j, "k_out": kout}
 
 
 def trades_variante(P, nombre, modo, slip):
@@ -232,19 +245,19 @@ def tabla_md(df):
     return "\n".join([cab, sep] + filas)
 
 
-def simular_cartera(tr, closes, bench_close, cuenta, riesgo, max_pos, seed=0):
+def simular_cartera(tr, px, bench_close, cuenta, riesgo, max_pos, seed=0, prioridad="aleatorio"):
     """Cartera con tu tamaño real: acciones = min(riesgo/(entrada-stop), max_pos/entrada),
-    sin apalancamiento (si no hay caja, se omite la operacion). Valora a mercado cada dia."""
+    sin apalancamiento (si no hay caja, se omite la operacion). Valora a mercado cada dia.
+    prioridad: con varias entradas el mismo dia, 'rs' = mayor RS Mansfield primero; 'aleatorio'."""
     if tr.empty:
         return None
-    rng = np.random.default_rng(seed)
     tr = tr.copy()
-    tr["_o"] = rng.random(len(tr))
+    if prioridad == "rs":
+        tr["_o"] = -tr["rs"].fillna(-1e9)
+    else:
+        tr["_o"] = np.random.default_rng(seed).random(len(tr))
     tr = tr.sort_values(["fecha_entrada", "_o"])
-    dias = bench_close.index[(bench_close.index >= tr["fecha_entrada"].min())
-                             & (bench_close.index <= tr["fecha_salida"].max())]
-    tick = sorted(tr["Ticker"].unique())
-    px = pd.DataFrame({t: closes[t] for t in tick}).reindex(dias).ffill()
+    dias = px.index[(px.index >= tr["fecha_entrada"].min()) & (px.index <= tr["fecha_salida"].max())]
     por_dia = {d: g_.to_dict("records") for d, g_ in tr.groupby("fecha_entrada")}
     abiertas, cerradas, omitidas = [], [], 0
     cash = float(cuenta)
@@ -276,10 +289,9 @@ def simular_cartera(tr, closes, bench_close, cuenta, riesgo, max_pos, seed=0):
     eq = pd.Series(eq, index=dias)
     años = max((dias[-1] - dias[0]).days / 365.25, 1e-9)
     dd = eq / eq.cummax() - 1
-    bajo = (dd < -1e-9).astype(int)
-    racha, mejor, ini = 0, 0, None
-    for d, b in bajo.items():
-        if b:
+    mejor, ini = 0, None
+    for d, b_ in (dd < -1e-9).items():
+        if b_:
             ini = ini or d
             mejor = max(mejor, (d - ini).days)
         else:
@@ -301,6 +313,24 @@ def simular_cartera(tr, closes, bench_close, cuenta, riesgo, max_pos, seed=0):
                     "S&P 500 DD max %": round(bdd.min() * 100, 1)}}
 
 
+def dif_vs_control(tdf, v, n=3000, seed=0):
+    """Diferencia de R medio frente al control, con IC95% remuestreando meses de entrada."""
+    t = tdf[tdf["Salida"] == "trailing"].copy()
+    t["mes"] = t["fecha_entrada"].dt.to_period("M")
+    a, c = t[t["Variante"] == v], t[t["Variante"] == CONTROL]
+    meses = sorted(set(a["mes"]) | set(c["mes"]))
+    ga = a.groupby("mes")["R"].agg(["sum", "count"]).reindex(meses).fillna(0)
+    gc = c.groupby("mes")["R"].agg(["sum", "count"]).reindex(meses).fillna(0)
+    idx = np.random.default_rng(seed).integers(0, len(meses), (n, len(meses)))
+    ma = ga["sum"].values[idx].sum(1) / np.maximum(ga["count"].values[idx].sum(1), 1)
+    mc = gc["sum"].values[idx].sum(1) / np.maximum(gc["count"].values[idx].sum(1), 1)
+    d = ma - mc
+    lo, hi = np.percentile(d, [2.5, 97.5])
+    pa, pc = a["R"].mean(), c["R"].mean()
+    return {"Variante": v, "R medio": round(pa, 2), "R control": round(pc, 2), "Diferencia": round(pa - pc, 2),
+            "IC95 diferencia": f"[{lo:.2f}, {hi:.2f}]", "Supera al control": "SI" if lo > 0 else ("NO (peor)" if hi < 0 else "no se distingue")}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tickers")
@@ -316,7 +346,8 @@ def main():
     ap.add_argument("--cuenta", type=float, default=100000)
     ap.add_argument("--riesgo", type=float, default=800, help="Riesgo maximo por operacion en dinero")
     ap.add_argument("--max-pos", type=float, default=5000)
-    ap.add_argument("--semilla", type=int, default=0, help="Desempate aleatorio de entradas el mismo dia")
+    ap.add_argument("--semilla", type=int, default=0, help="Semilla base (control aleatorio y desempates)")
+    ap.add_argument("--semillas", type=int, default=5, help="Repeticiones con desempate aleatorio para medir el ruido")
     args = ap.parse_args()
     os.makedirs(args.salida, exist_ok=True)
     corte = pd.Timestamp(args.corte)
@@ -356,7 +387,7 @@ def main():
         if k % 100 == 0:
             print(f"  {k}/{len(tickers)}")
         try:
-            P = preparar_serie(datos[t], bench_w, et_mkt)
+            P = preparar_serie(datos[t], bench_w, et_mkt, args.semilla, t)
         except Exception as e:  # noqa
             avisos.append(f"{t}: error ({type(e).__name__}: {e})")
             continue
@@ -396,6 +427,9 @@ def main():
             f[f"Retorno +{h}b %"] = round(float(np.mean(x)) * 100, 1) if x else np.nan
         filas.append(f)
     df = pd.DataFrame(filas)
+    rc = df[(df["Variante"] == CONTROL) & (df["Salida"] == "trailing")]["R medio"]
+    if len(rc):
+        df.insert(df.columns.get_loc("R medio") + 1, "R vs control", (df["R medio"] - rc.iloc[0]).round(2))
     for h in HS:
         df[f"Base +{h}b %"] = round(base[h], 1)
     df.to_csv(os.path.join(args.salida, "backtest_resumen.csv"), index=False, encoding="utf-8-sig")
@@ -403,26 +437,36 @@ def main():
     tdf = pd.DataFrame(todos)
     tdf.drop(columns=["k_out"]).to_csv(os.path.join(args.salida, "backtest_trades.csv"), index=False)
 
-    # --- Cartera
+    # --- Diferencia frente al control
+    dfd = pd.DataFrame([dif_vs_control(tdf, v) for v in VARIANTES if v != CONTROL]) if len(tdf) else pd.DataFrame()
+    if len(dfd):
+        dfd.to_csv(os.path.join(args.salida, "backtest_vs_control.csv"), index=False, encoding="utf-8-sig")
+
+    # --- Cartera (prioridad por RS) y ruido con desempates aleatorios
+    px_all = pd.DataFrame(closes).reindex(bench_close.index).ffill()
     carteras, filas_c = {}, []
     for v in VARIANTES:
         sub = tdf[(tdf["Variante"] == v) & (tdf["Salida"] == "trailing")] if len(tdf) else tdf
-        c_ = simular_cartera(sub, closes, bench_close, args.cuenta, args.riesgo, args.max_pos, args.semilla)
-        if c_:
-            carteras[v] = c_
-            filas_c.append({"Variante": v, **c_["res"]})
+        c_ = simular_cartera(sub, px_all, bench_close, args.cuenta, args.riesgo, args.max_pos, prioridad="rs")
+        if not c_:
+            continue
+        carteras[v] = c_
+        cag = [simular_cartera(sub, px_all, bench_close, args.cuenta, args.riesgo, args.max_pos, seed=sd)["res"]["CAGR %"]
+               for sd in range(args.semillas)]
+        filas_c.append({"Variante": v, **c_["res"], "CAGR aleat. media %": round(float(np.mean(cag)), 1),
+                        "CAGR aleat. min": round(min(cag), 1), "CAGR aleat. max": round(max(cag), 1)})
     dfc = pd.DataFrame(filas_c)
     if len(dfc):
         dfc.to_csv(os.path.join(args.salida, "backtest_cartera.csv"), index=False, encoding="utf-8-sig")
         fig, ax = plt.subplots(2, 1, figsize=(11, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]})
-        sel = [v for v in (VARIANTES[4], VARIANTES[2], VARIANTES[5], VARIANTES[9]) if v in carteras]
+        sel = [v for v in (CONTROL, VARIANTES[2], VARIANTES[7], VARIANTES[4]) if v in carteras]
         for v in sel:
             ax[0].plot(carteras[v]["eq"], lw=1.3, label=v[:42])
             ax[1].plot(carteras[v]["dd"] * 100, lw=1.0)
         e0 = carteras[sel[0]]["eq"]
         bc = bench_close.reindex(e0.index).ffill()
         ax[0].plot(bc / bc.iloc[0] * args.cuenta, color="grey", lw=1.3, ls="--", label="S&P 500 (comprar y mantener)")
-        ax[0].set_title(f"Cartera simulada: {args.riesgo:.0f} de riesgo, max {args.max_pos:.0f} por posicion, sin apalancamiento")
+        ax[0].set_title(f"Cartera simulada (prioridad RS): {args.riesgo:.0f} de riesgo, max {args.max_pos:.0f} por posicion")
         ax[0].legend(fontsize=8)
         ax[0].grid(alpha=0.3)
         ax[1].set_ylabel("Caida desde maximo %")
@@ -462,22 +506,30 @@ def main():
           f"({corte:%Y-%m-%d}) y exige que se mantenga en la posterior.",
           "- Los trades no son independientes (las rupturas se concentran en fases alcistas): el t-stat sobreestima.",
           "- `Base +Nb %` = retorno medio de entrar cualquier dia valido (sin señal) a N barras.", "",
+          "- **CONTROL:** entra en dias aleatorios (~1% de las barras validas) con el mismo stop y la misma salida. "
+          "Si una variante no lo supera, sus entradas no aportan: el resultado viene de la salida y del mercado.", "",
           "## Operaciones (R = ganancia / riesgo inicial)", "", tabla_md(df), ""]
+    if len(dfd):
+        md += ["## Diferencia de R frente al control (IC95% agrupado por mes)", "", tabla_md(dfd), ""]
     if len(dfc):
-        md += ["## Cartera con tu tamaño real", "", tabla_md(dfc), ""]
+        md += ["## Cartera con tu tamaño real (prioridad por RS cuando falta caja)", "",
+               f"`CAGR aleat.` = {args.semillas} repeticiones con desempate aleatorio: mide cuanto del resultado es suerte.", "",
+               tabla_md(dfc), ""]
     if len(por_año):
         md += ["## Estado (etapa 2 + RS>0, trailing) por año de entrada", "", tabla_md(por_año), ""]
     open(os.path.join(args.salida, "backtest.md"), "w", encoding="utf-8").write("\n".join(md))
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", 30)
-    cols = ["Variante", "Salida", "Trades", "R medio", "Factor beneficio", "t-stat R", "R antes corte", "n antes",
-            "R desde corte", "n desde"]
+    cols = ["Variante", "Salida", "Trades", "R medio", "R vs control", "Factor beneficio", "R antes corte", "R desde corte"]
     print(df[[c for c in cols if c in df.columns]].to_string(index=False))
+    if len(dfd):
+        print()
+        print(dfd.to_string(index=False))
     if len(dfc):
         print()
-        print(dfc[["Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %", "DD max %",
-                   "Racha bajo maximos (años)", "Capital invertido medio %", "S&P 500 CAGR %",
-                   "S&P 500 DD max %"]].to_string(index=False))
+        print(dfc[["Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %", "CAGR aleat. media %",
+                   "CAGR aleat. min", "CAGR aleat. max", "DD max %", "Racha bajo maximos (años)",
+                   "S&P 500 CAGR %"]].to_string(index=False))
     print(f"\nPeriodo {ini:%Y-%m-%d} a {fin:%Y-%m-%d}, {usados} tickers. Resultados en {os.path.abspath(args.salida)}")
     print("AVISO: sesgo de supervivencia y riesgo de sobreajuste: comparar variantes, no tomar como rentabilidad esperada.")
 
