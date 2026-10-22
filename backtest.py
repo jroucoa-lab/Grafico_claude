@@ -33,6 +33,11 @@ que cumplen la condicion cada dia (sin las 20 posiciones ni los desempates) fren
 todas las acciones. Es la forma mas limpia de ver si estar en etapa 2 con RS>0 aporta algo.
 Incluye etapa 4 como contraste (deberia rendir peor que "todas") y una comparacion con IC95%.
 
+PRUEBA DE MOMENTUM POR RS (backtest_rs_momentum.csv): cada mes se ordenan todas las acciones por
+RS Mansfield y se mantienen a partes iguales los quintiles (Q1 = RS mas bajo ... Q5 = mas alto), el
+decil superior y el quintil superior dentro de etapa 2, frente a todas. Sin limite de caja. Si el
+RS ordena de verdad, el rendimiento debe subir de Q1 a Q5.
+
 CUIDADO CON EL SOBREAJUSTE: probar muchas variantes sobre los mismos datos siempre
 encuentra alguna que "funciona". Elige con la mitad anterior a --corte y comprueba
 que se mantiene en la mitad posterior.
@@ -361,6 +366,48 @@ def cartera_sin_limite(ret, cond, coste):
     return r_net, n, turn
 
 
+def cartera_rs_mensual(ret, rs, lo, hi, coste, filtro=None):
+    """Cada mes: acciones con percentil de RS en (lo, hi] (calculado al cierre del mes anterior,
+    solo entre las validas y, si hay filtro, entre las que lo cumplen), a partes iguales y sin tocar
+    hasta fin de mes. Coste por lado sobre la rotacion real (con deriva de pesos)."""
+    idx = ret.index
+    r_out = pd.Series(0.0, index=idx)
+    n_out = pd.Series(0, index=idx)
+    t_out = pd.Series(0.0, index=idx)
+    w_prev = pd.Series(dtype=float)
+    prev_day = None
+    for _, g_ in ret.groupby(idx.to_period("M")):
+        miembros = []
+        if prev_day is not None:
+            rs_p = rs.loc[prev_day]
+            ok = rs_p.notna()
+            if filtro is not None:
+                ok &= filtro.loc[prev_day]
+            if ok.sum() >= 10:
+                pct = rs_p[ok].rank(pct=True)
+                miembros = [m for m in pct.index[(pct > lo) & (pct <= hi)] if g_[m].notna().any()]
+        if not miembros:
+            if len(w_prev):
+                t_out.loc[g_.index[0]] = w_prev.sum()
+            w_prev = pd.Series(dtype=float)
+        else:
+            w_new = pd.Series(1.0 / len(miembros), index=miembros)
+            allw = w_new.index.union(w_prev.index)
+            turn = (w_new.reindex(allw).fillna(0) - w_prev.reindex(allw).fillna(0)).abs().sum()
+            cum = (1 + g_[miembros].fillna(0)).cumprod()
+            path = cum.mean(axis=1)
+            rr = path.pct_change()
+            rr.iloc[0] = path.iloc[0] - 1
+            rr.iloc[0] = (1 + rr.iloc[0]) * (1 - coste * turn) - 1
+            r_out.loc[g_.index] = rr.values
+            n_out.loc[g_.index] = len(miembros)
+            t_out.loc[g_.index[0]] = turn
+            fin = cum.iloc[-1]
+            w_prev = fin / fin.sum()
+        prev_day = g_.index[-1]
+    return r_out, n_out, t_out
+
+
 def exceso_ic(r_a, r_b, n=3000, seed=0):
     """Exceso diario medio de A sobre B anualizado, con IC95% remuestreando meses."""
     d = (r_a - r_b).dropna()
@@ -452,6 +499,7 @@ def main():
     closes = {}
     cond_cols = {}
     valid_cols = {}
+    rs_cols = {}
     usados, ini, fin = 0, None, None
     for k, t in enumerate(tickers, 1):
         if t not in datos or len(datos[t]) < 400:
@@ -466,6 +514,7 @@ def main():
         usados += 1
         closes[t] = P["dd"]["Close"]
         valid_cols[t] = P["valido_s"]
+        rs_cols[t] = pd.Series(P["rs"], index=P["dd"].index)
         for nom_c, ser_c in P["E"].items():
             cond_cols.setdefault(nom_c, {})[t] = ser_c & P["valido_s"]
         val = np.flatnonzero(P["valido"])
@@ -532,8 +581,9 @@ def main():
     ventanas_sl = [(f"antes {corte:%Y-%m}", pd.Timestamp.min, corte), (f"desde {corte:%Y-%m}", corte, pd.Timestamp.max),
                    (f"hasta {pd.Timestamp(args.sin_tramo_desde):%Y-%m}", pd.Timestamp.min, pd.Timestamp(args.sin_tramo_desde))]
 
-    def fila_sl(nombre, r_net, n, turn, es_base=False):
+    def fila_sl(nombre, r_net, n, turn, es_base=False, base=None):
         r_net, n, turn = (x[x.index >= fecha_ini] for x in (r_net, n, turn))
+        base_r = r_todas if base is None else base[base.index >= fecha_ini]
         eq = (1 + r_net).cumprod()
         f = {"Cartera": nombre,
              "CAGR %": round(((eq.iloc[-1]) ** (1 / años_t) - 1) * 100, 1),
@@ -544,11 +594,11 @@ def main():
         f["Acciones medias"] = round(float(n[n > 0].mean()), 0) if (n > 0).any() else np.nan
         f["Rotacion anual (x cartera)"] = round(float(turn.sum() / años_t), 1)
         if not es_base:
-            ex, lo, hi = exceso_ic(r_net, r_todas)
+            ex, lo, hi = exceso_ic(r_net, base_r)
             act = n > 0
             f["Exceso anual vs todas %"] = round(ex, 1)
             f["IC95 exceso"] = f"[{lo:.1f}, {hi:.1f}]"
-            f["Exceso solo dias invertida %"] = round(float((r_net - r_todas)[act].mean() * 252 * 100), 1)
+            f["Exceso solo dias invertida %"] = round(float((r_net - base_r)[act].mean() * 252 * 100), 1)
             f["Veredicto"] = "SUPERA" if lo > 0 else ("PEOR" if hi < 0 else "no se distingue")
         return f, eq
 
@@ -576,6 +626,35 @@ def main():
     ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(os.path.join(args.salida, "backtest_sin_limite.png"), dpi=110)
+    plt.close(fig)
+
+    # --- Momentum por RS (cuantiles mensuales, sin limite de caja)
+    rs_m = pd.DataFrame(rs_cols).reindex(idx_all)
+    et2_m = pd.DataFrame(cond_cols["Etapa 2 sola"]).reindex(idx_all).fillna(False).astype(bool)
+    r_b, n_b, t_b = cartera_rs_mensual(ret_all, rs_m, 0.0, 1.0, args.coste)
+    fb, eq_b = fila_sl("TODAS (mensual)", r_b, n_b, t_b, True)
+    filas_rs, eqs_rs = [fb], {"Todas": eq_b}
+    for nom_q, lo_q, hi_q, filt in [("Q1 (RS mas bajo)", 0, .2, None), ("Q2", .2, .4, None), ("Q3", .4, .6, None),
+                                    ("Q4", .6, .8, None), ("Q5 (RS mas alto)", .8, 1.0, None),
+                                    ("Decil superior (D10)", .9, 1.0, None),
+                                    ("Etapa 2: quintil superior de RS", .8, 1.0, et2_m)]:
+        r_q, n_q, t_q = cartera_rs_mensual(ret_all, rs_m, lo_q, hi_q, args.coste, filt)
+        f_q, eq_q = fila_sl(nom_q, r_q, n_q, t_q, base=r_b)
+        filas_rs.append(f_q)
+        eqs_rs[nom_q] = eq_q
+    dfr = pd.DataFrame(filas_rs)
+    dfr.to_csv(os.path.join(args.salida, "backtest_rs_momentum.csv"), index=False, encoding="utf-8-sig")
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    for k_, v_ in eqs_rs.items():
+        if k_ in ("Todas", "Q1 (RS mas bajo)", "Q3", "Q5 (RS mas alto)", "Decil superior (D10)"):
+            ax.plot(v_ / v_.iloc[0] * args.cuenta, lw=1.3, label=k_)
+    ax.plot(bs / bs.iloc[0] * args.cuenta, color="grey", ls="--", lw=1.2, label="S&P 500")
+    ax.set_yscale("log")
+    ax.set_title("Momentum por RS: cuantiles mensuales equiponderados (escala log)")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(args.salida, "backtest_rs_momentum.png"), dpi=110)
     plt.close(fig)
     carteras, filas_c = {}, []
     for v in VARIANTES:
@@ -687,6 +766,10 @@ def main():
            "Cada dia se mantiene a partes iguales las acciones que cumplian la condicion al cierre anterior; sin ninguna, caja. "
            "`Exceso` = diferencia con la cartera de TODAS las acciones, con IC95% remuestreando meses. "
            "Etapa 4 es un contraste: si la clasificacion sirve, debe rendir peor que todas.", "", tabla_md(dfs), ""]
+    md += ["## Momentum por RS (cuantiles mensuales, sin limite de caja)", "",
+           "Q1 = acciones con RS mas bajo, Q5 = RS mas alto (entre todas las validas, al cierre del mes anterior). "
+           "Si el RS ordena de verdad, el CAGR debe subir de Q1 a Q5. Ojo: el universo son componentes actuales "
+           "(algunas entraron al indice despues de subir), lo que favorece al momentum.", "", tabla_md(dfr), ""]
     if len(dfm):
         md += ["## CAGR por mitades (cada ventana reinicia el capital)", "",
                f"`antes/desde {corte:%Y-%m}` = dos mitades; `hasta {excl:%Y-%m}` = sin el tramo final. "
@@ -711,6 +794,10 @@ def main():
     print()
     print(dfs[["Cartera", "CAGR %", "DD max %", "% del tiempo invertida", "Acciones medias", "Exceso anual vs todas %",
                "IC95 exceso", "Veredicto"] if "Veredicto" in dfs.columns else ["Cartera", "CAGR %"]].to_string(index=False))
+    print()
+    print(dfr[["Cartera", "CAGR %", "DD max %", "CAGR antes " + f"{corte:%Y-%m}", "CAGR desde " + f"{corte:%Y-%m}",
+               "Acciones medias", "Rotacion anual (x cartera)", "Exceso anual vs todas %", "IC95 exceso",
+               "Veredicto"] if "Veredicto" in dfr.columns else ["Cartera", "CAGR %"]].to_string(index=False))
     if len(dfm):
         print()
         print(dfm.to_string(index=False))
