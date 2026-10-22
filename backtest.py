@@ -313,6 +313,15 @@ def simular_cartera(tr, px, bench_close, cuenta, riesgo, max_pos, seed=0, priori
                     "S&P 500 DD max %": round(bdd.min() * 100, 1)}}
 
 
+def cagr_ventana(eq, a, b):
+    """CAGR (%) y caida maxima (%) de la curva de cuenta entre a y b, reiniciando el capital en a."""
+    x = eq[(eq.index >= a) & (eq.index < b)]
+    if len(x) < 60:
+        return np.nan, np.nan
+    años = (x.index[-1] - x.index[0]).days / 365.25
+    return ((x.iloc[-1] / x.iloc[0]) ** (1 / años) - 1) * 100, (x / x.cummax() - 1).min() * 100
+
+
 def dif_vs_control(tdf, v, n=3000, seed=0):
     """Diferencia de R medio frente al control, con IC95% remuestreando meses de entrada."""
     t = tdf[tdf["Salida"] == "trailing"].copy()
@@ -342,6 +351,8 @@ def main():
     ap.add_argument("--solo-cache", action="store_true")
     ap.add_argument("--coste", type=float, default=0.0005, help="Deslizamiento por lado (0.0005 = 0.05%)")
     ap.add_argument("--corte", default="2022-01-01", help="Fecha que separa las dos mitades")
+    ap.add_argument("--sin-tramo-desde", default="2024-01-01",
+                    help="Tercera ventana: CAGR solo hasta esta fecha (quita el tramo final)")
     ap.add_argument("--con-objetivo", action="store_true", help="Prueba tambien la salida por altura de base")
     ap.add_argument("--cuenta", type=float, default=100000)
     ap.add_argument("--riesgo", type=float, default=800, help="Riesgo maximo por operacion en dinero")
@@ -451,11 +462,39 @@ def main():
         if not c_:
             continue
         carteras[v] = c_
-        cag = [simular_cartera(sub, px_all, bench_close, args.cuenta, args.riesgo, args.max_pos, seed=sd)["res"]["CAGR %"]
-               for sd in range(args.semillas)]
+        sims = [simular_cartera(sub, px_all, bench_close, args.cuenta, args.riesgo, args.max_pos, seed=sd)
+                for sd in range(args.semillas)]
+        c_["eqs_alea"] = [x["eq"] for x in sims]
+        cag = [x["res"]["CAGR %"] for x in sims]
         filas_c.append({"Variante": v, **c_["res"], "CAGR aleat. media %": round(float(np.mean(cag)), 1),
                         "CAGR aleat. min": round(min(cag), 1), "CAGR aleat. max": round(max(cag), 1)})
     dfc = pd.DataFrame(filas_c)
+    excl = pd.Timestamp(args.sin_tramo_desde)
+    ventanas = [(f"antes {corte:%Y-%m}", pd.Timestamp.min, corte), (f"desde {corte:%Y-%m}", corte, pd.Timestamp.max),
+                (f"hasta {excl:%Y-%m}", pd.Timestamp.min, excl)]
+    filas_m = []
+    for v, c_ in carteras.items():
+        f = {"Variante": v}
+        for nom, a, b in ventanas:
+            f[f"CAGR {nom} (RS)"] = round(cagr_ventana(c_["eq"], a, b)[0], 1)
+        for nom, a, b in ventanas:
+            f[f"CAGR {nom} (aleat.)"] = round(float(np.nanmean([cagr_ventana(e, a, b)[0] for e in c_["eqs_alea"]])), 1)
+        filas_m.append(f)
+    if carteras:
+        sp_eq = bench_close
+        f = {"Variante": "S&P 500 (comprar y mantener)"}
+        for pri in ("(RS)", "(aleat.)"):
+            for nom, a, b in ventanas:
+                f[f"CAGR {nom} {pri}"] = round(cagr_ventana(sp_eq, max(a, list(carteras.values())[0]["eq"].index[0]), b)[0], 1)
+        filas_m.append(f)
+    dfm = pd.DataFrame(filas_m)
+    if len(dfm):
+        sp = dfm.iloc[-1]
+        cols_rs = [c for c in dfm.columns if "(RS)" in c]
+        dfm["Gana al S&P en las 2 mitades (RS)"] = [
+            "SI" if all(r[c] > sp[c] for c in cols_rs[:2]) else "no" for _, r in dfm.iterrows()]
+        dfm.iloc[-1, dfm.columns.get_loc("Gana al S&P en las 2 mitades (RS)")] = ""
+        dfm.to_csv(os.path.join(args.salida, "backtest_mitades.csv"), index=False, encoding="utf-8-sig")
     if len(dfc):
         dfc.to_csv(os.path.join(args.salida, "backtest_cartera.csv"), index=False, encoding="utf-8-sig")
         fig, ax = plt.subplots(2, 1, figsize=(11, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]})
@@ -511,6 +550,11 @@ def main():
           "## Operaciones (R = ganancia / riesgo inicial)", "", tabla_md(df), ""]
     if len(dfd):
         md += ["## Diferencia de R frente al control (IC95% agrupado por mes)", "", tabla_md(dfd), ""]
+    if len(dfm):
+        md += ["## CAGR por mitades (cada ventana reinicia el capital)", "",
+               f"`antes/desde {corte:%Y-%m}` = dos mitades; `hasta {excl:%Y-%m}` = sin el tramo final. "
+               "(RS) = prioridad por RS cuando falta caja; (aleat.) = media de los desempates aleatorios.", "",
+               tabla_md(dfm), ""]
     if len(dfc):
         md += ["## Cartera con tu tamaño real (prioridad por RS cuando falta caja)", "",
                f"`CAGR aleat.` = {args.semillas} repeticiones con desempate aleatorio: mide cuanto del resultado es suerte.", "",
@@ -525,6 +569,9 @@ def main():
     if len(dfd):
         print()
         print(dfd.to_string(index=False))
+    if len(dfm):
+        print()
+        print(dfm.to_string(index=False))
     if len(dfc):
         print()
         print(dfc[["Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %", "CAGR aleat. media %",
