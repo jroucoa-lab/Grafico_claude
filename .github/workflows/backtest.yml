@@ -34,19 +34,23 @@ jobs:
               --riesgo ${{ github.event.inputs.riesgo }} --max-pos "$mp" \
               --salida "resultados_backtest/mp_$mp"
           done
-      - name: Comparativa entre valores de max_pos
+      - name: Comparativas entre valores de max_pos
         run: |
           python - <<'PY'
           import glob, pandas as pd
-          filas = []
-          for p in sorted(glob.glob("resultados_backtest/mp_*/backtest_cartera.csv")):
-              d = pd.read_csv(p)
-              d.insert(0, "max_pos", p.split("mp_")[1].split("/")[0])
-              filas.append(d)
+          def juntar(nombre):
+              filas = []
+              for p in sorted(glob.glob(f"resultados_backtest/mp_*/{nombre}")):
+                  d = pd.read_csv(p)
+                  d.insert(0, "max_pos", p.split("mp_")[1].split("/")[0])
+                  filas.append(d)
+              return pd.concat(filas)
+          cart = juntar("backtest_cartera.csv")
           cols = ["max_pos", "Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %",
                   "CAGR aleat. media %", "DD max %", "Racha bajo maximos (años)",
-                  "Capital invertido medio %", "S&P 500 CAGR %"]
-          pd.concat(filas)[cols].to_csv("resultados_backtest/comparativa_max_pos.csv", index=False)
+                  "Capital invertido medio %", "S&P 500 CAGR %", "Equipond. CAGR %", "Equipond. DD max %"]
+          cart[[c for c in cols if c in cart.columns]].to_csv("resultados_backtest/comparativa_max_pos.csv", index=False)
+          juntar("backtest_mitades.csv").to_csv("resultados_backtest/comparativa_mitades.csv", index=False)
           PY
       - uses: actions/upload-artifact@v4
         with:
