@@ -51,6 +51,9 @@ jobs:
                   "Capital invertido medio %", "S&P 500 CAGR %", "Equipond. CAGR %", "Equipond. DD max %"]
           cart[[c for c in cols if c in cart.columns]].to_csv("resultados_backtest/comparativa_max_pos.csv", index=False)
           juntar("backtest_mitades.csv").to_csv("resultados_backtest/comparativa_mitades.csv", index=False)
+          import shutil
+          prim = sorted(glob.glob("resultados_backtest/mp_*/backtest_sin_limite.csv"))[0]
+          shutil.copy(prim, "resultados_backtest/sin_limite.csv")
           PY
       - uses: actions/upload-artifact@v4
         with:
