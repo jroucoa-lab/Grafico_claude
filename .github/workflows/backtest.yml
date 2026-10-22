@@ -6,6 +6,12 @@ on:
       anios:
         description: "Años de historico"
         default: "10"
+      max_pos:
+        description: "Maximo por posicion en $ (varios valores separados por espacio)"
+        default: "2500 5000 10000"
+      riesgo:
+        description: "Riesgo maximo por operacion en $"
+        default: "800"
 jobs:
   backtest:
     runs-on: ubuntu-latest
@@ -21,7 +27,27 @@ jobs:
           path: cache_bt
           key: datos-bt-${{ github.run_id }}
           restore-keys: datos-bt-
-      - run: python backtest.py --sp500 --años ${{ github.event.inputs.anios }}
+      - name: Backtest (uno por cada valor de max_pos; la descarga se hace una sola vez)
+        run: |
+          for mp in ${{ github.event.inputs.max_pos }}; do
+            python backtest.py --sp500 --años ${{ github.event.inputs.anios }} \
+              --riesgo ${{ github.event.inputs.riesgo }} --max-pos "$mp" \
+              --salida "resultados_backtest/mp_$mp"
+          done
+      - name: Comparativa entre valores de max_pos
+        run: |
+          python - <<'PY'
+          import glob, pandas as pd
+          filas = []
+          for p in sorted(glob.glob("resultados_backtest/mp_*/backtest_cartera.csv")):
+              d = pd.read_csv(p)
+              d.insert(0, "max_pos", p.split("mp_")[1].split("/")[0])
+              filas.append(d)
+          cols = ["max_pos", "Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %",
+                  "CAGR aleat. media %", "DD max %", "Racha bajo maximos (años)",
+                  "Capital invertido medio %", "S&P 500 CAGR %"]
+          pd.concat(filas)[cols].to_csv("resultados_backtest/comparativa_max_pos.csv", index=False)
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: backtest
