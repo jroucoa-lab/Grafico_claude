@@ -1378,7 +1378,7 @@ def ficha(r, cfg):
     L.append(f"- MACD D: histograma {sh} ({m['hist']:.3f}); {cr}")
     cz = f"cruce de cero hace {r['rs_cruce']} sem" if r["rs_cruce"] is not None else "sin cruce de cero en 13 sem"
     L.append(f"- RS Mansfield S vs S&P: {f2(r['rs_sp'])} (hace 4s {f2(r['rs_sp_4'])}, 13s {f2(r['rs_sp_13'])}); {cz}; "
-             f"vs sector {f2(r['rs_sec'])}")
+             f"vs sector {f2(r['rs_sec'])}; percentil RS {f2(r.get('rs_pct'), 0)}")
     for tf, T in (("D", D), ("W", W)):
         sp = ", ".join(f"{p_:.2f} ({pct(p_, c):+.1f}%, {tq}t)" for p_, tq in T["sop"][:2]) or "ninguno"
         rs_ = ", ".join(f"{p_:.2f} ({pct(p_, c):+.1f}%, {tq}t)" for p_, tq in T["res"][:2]) or "ninguna (maximos)"
@@ -1434,7 +1434,7 @@ def fila_ranking(r, pos):
             "Riesgo real $": round(p["riesgo_real"]) if p else np.nan,
             "Limite": p["limite"] if p else "", "Modo entrada": p["modo"] if p else "", "Etapa": r["etapa"],
             "RS Mansfield S": round(r["rs_sp"], 2) if np.isfinite(r["rs_sp"]) else np.nan,
-            "Tendencia D": r["tend_d"], "Vigilar (cierre sobre)": round(r["activar"], 2) if np.isfinite(r["activar"]) else np.nan,
+            "RS percentil": r.get("rs_pct", np.nan), "Tendencia D": r["tend_d"], "Vigilar (cierre sobre)": round(r["activar"], 2) if np.isfinite(r["activar"]) else np.nan,
             "Razon": r["razon"], "Alertas": r["alertas"]}
 
 
@@ -1561,6 +1561,8 @@ def main():
     ap.add_argument("--detalle", choices=["limpio", "normal", "completo"], default="normal")
     ap.add_argument("--top", type=int, default=30, help="Tickers en PDF y fichas cuando se analiza el S&P 500")
     ap.add_argument("--sin-pdf", action="store_true")
+    ap.add_argument("--orden", choices=["rs", "score"], default="rs",
+                    help="Orden dentro de cada direccion: RS Mansfield (defecto) o score")
     ap.add_argument("--dias", type=int, default=170, help="Velas diarias en el grafico")
     ap.add_argument("--semanas", type=int, default=156, help="Velas semanales en el grafico")
     ap.add_argument("--marcar", type=int, default=15, help="Marcar velas de las ultimas N barras diarias")
@@ -1652,7 +1654,15 @@ def main():
         sys.exit("Sin resultados.")
 
     orden = {"Compra": 0, "Esperar": 1, "Venta": 2}
-    resultados.sort(key=lambda r: (orden[r["dir"]], -r["score"]))
+    rs_s = pd.Series({r["ticker"]: r["rs_sp"] for r in resultados})
+    pct_rs = (rs_s.rank(pct=True) * 100).round(0)
+    for r in resultados:
+        r["rs_pct"] = pct_rs.get(r["ticker"], np.nan)
+    if args.orden == "rs":
+        # En el backtest, ordenar por RS cuando hay mas señales que caja fue lo que mas rindio
+        resultados.sort(key=lambda r: (orden[r["dir"]], -(r["rs_sp"] if np.isfinite(r["rs_sp"]) else -1e9), -r["score"]))
+    else:
+        resultados.sort(key=lambda r: (orden[r["dir"]], -r["score"]))
     sel = resultados if modo == "tickers" else resultados[:args.top]
 
     # --- Ranking, Excel, fichas
