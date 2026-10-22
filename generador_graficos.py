@@ -1032,13 +1032,8 @@ def puntuar(r):
             s -= 10
         elif r["tend_d"] != "bajista":
             s += 5
-    figs = [f["nombre"] for tf in ("D", "W") for f in r["tf"][tf]["fig"]]
-    if "Ruptura de base/rango" in figs:
-        s += 10
-        vr = [f.get("vol_ratio", np.nan) for tf in ("D", "W") for f in r["tf"][tf]["fig"]
-              if f["nombre"] == "Ruptura de base/rango"]
-        if any(np.isfinite(v) and v >= 1.5 for v in vr):
-            s += 5
+    # Ruptura de base y volumen NO puntuan: en el backtest (S&P 500, 9 años) no mejoraron a
+    # etapa 2 + RS>0 y su variante completa fue la peor (ver backtest.py).
     if r["dist_max52"] >= -10:
         s += 5
     if np.isfinite(r["dist_sma30"]) and r["dist_sma30"] > 25:
