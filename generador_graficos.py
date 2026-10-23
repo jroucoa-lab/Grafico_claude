@@ -162,6 +162,7 @@ def _extraer(df, t):
 
 def bajar_lote(tickers, start=None, años=6, reintentos=3):
     import yfinance as yf
+    inicio = start if start is not None else pd.Timestamp.today().normalize() - pd.DateOffset(years=años)
     out, pend = {}, list(tickers)
     for intento in range(reintentos):
         if not pend:
@@ -173,10 +174,7 @@ def bajar_lote(tickers, start=None, años=6, reintentos=3):
             try:
                 kw = dict(interval="1d", auto_adjust=False, progress=False,
                           group_by="ticker", threads=True)
-                if start is not None:
-                    kw["start"] = start.strftime("%Y-%m-%d")
-                else:
-                    kw["period"] = f"{años}y"
+                kw["start"] = inicio.strftime("%Y-%m-%d")
                 df = yf.download(lote, **kw)
             except Exception as e:  # noqa
                 print(f"  ! error en lote: {e}")
@@ -1756,4 +1754,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
