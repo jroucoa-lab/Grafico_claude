@@ -38,6 +38,10 @@ RS Mansfield y se mantienen a partes iguales los quintiles (Q1 = RS mas bajo ...
 decil superior y el quintil superior dentro de etapa 2, frente a todas. Sin limite de caja. Si el
 RS ordena de verdad, el rendimiento debe subir de Q1 a Q5.
 
+MEMBRESIA PUNTUAL (--solo-miembros): cada accion solo cuenta desde su fecha de alta en el S&P 500
+(columna "Date added" de Wikipedia). Quita el sesgo de "entro al indice despues de subir"; NO quita el
+de las empresas que salieron del indice. Comparar la ejecucion normal con esta mide ese sesgo.
+
 CUIDADO CON EL SOBREAJUSTE: probar muchas variantes sobre los mismos datos siempre
 encuentra alguna que "funciona". Elige con la mitad anterior a --corte y comprueba
 que se mantiene en la mitad posterior.
@@ -459,6 +463,8 @@ def main():
     ap.add_argument("--corte", default="2022-01-01", help="Fecha que separa las dos mitades")
     ap.add_argument("--sin-tramo-desde", default="2024-01-01",
                     help="Tercera ventana: CAGR solo hasta esta fecha (quita el tramo final)")
+    ap.add_argument("--solo-miembros", action="store_true",
+                    help="Cada accion cuenta solo desde su fecha de alta en el S&P 500 (membresia puntual)")
     ap.add_argument("--con-objetivo", action="store_true", help="Prueba tambien la salida por altura de base")
     ap.add_argument("--cuenta", type=float, default=100000)
     ap.add_argument("--riesgo", type=float, default=800, help="Riesgo maximo por operacion en dinero")
@@ -470,14 +476,23 @@ def main():
     corte = pd.Timestamp(args.corte)
 
     tickers = []
+    sp = None
     if not args.sp500:
         txt = ""
         if args.archivo and os.path.exists(args.archivo):
             txt = open(args.archivo, encoding="utf-8").read()
         tickers = g.parse_tickers((args.tickers or "") + "," + txt)
-    if not tickers:
+    if not tickers or args.solo_miembros:
         p = os.path.join(args.cache, "sp500.csv")
         sp = (pd.read_csv(p) if os.path.exists(p) else None) if args.solo_cache else g.cargar_sp500(args.cache)
+    alta = {}
+    if args.solo_miembros:
+        if sp is None or "Alta" not in sp.columns:
+            sys.exit("--solo-miembros necesita la fecha de alta (columna 'Alta' en cache/sp500.csv). "
+                     "Borra la cache de sp500.csv y vuelve a ejecutar con red.")
+        alta = {t: pd.to_datetime(a, errors="coerce") for t, a in zip(sp["Ticker"], sp["Alta"])}
+        print(f"Membresia puntual: {sum(pd.notna(v) for v in alta.values())} fechas de alta conocidas")
+    if not tickers:
         if sp is None:
             sys.exit("Sin tickers y sin lista del S&P 500.")
         tickers = list(dict.fromkeys(sp["Ticker"].tolist()))
@@ -511,6 +526,13 @@ def main():
         except Exception as e:  # noqa
             avisos.append(f"{t}: error ({type(e).__name__}: {e})")
             continue
+        if args.solo_miembros and pd.notna(alta.get(t, pd.NaT)):
+            mem = pd.Series(P["dd"].index >= alta[t], index=P["dd"].index)
+            P["valido"] = P["valido"] & mem.values
+            P["valido_s"] = P["valido_s"] & mem
+            P["S"] = {k_: x_ & mem for k_, x_ in P["S"].items()}
+            P["E"] = {k_: x_ & mem for k_, x_ in P["E"].items()}
+            P["rs"] = np.where(mem.values, P["rs"], np.nan)
         usados += 1
         closes[t] = P["dd"]["Close"]
         valid_cols[t] = P["valido_s"]
@@ -568,10 +590,16 @@ def main():
 
     # --- Cartera (prioridad por RS) y ruido con desempates aleatorios
     px_all = pd.DataFrame(closes).reindex(bench_close.index).ffill()
-    ew = equiponderado(px_all)
+    px_ew = px_all
+    if args.solo_miembros:
+        mem_m = pd.DataFrame({t: pd.Series(px_all.index >= alta[t], index=px_all.index)
+                              if pd.notna(alta.get(t, pd.NaT)) else pd.Series(True, index=px_all.index)
+                              for t in px_all.columns})
+        px_ew = px_all.where(mem_m)
+    ew = equiponderado(px_ew)
 
     # --- Cartera sin limite de caja: condicion vs todas las acciones
-    ret_all = px_all.pct_change()
+    ret_all = px_ew.pct_change()
     idx_all = px_all.index
     todas_m = pd.DataFrame(valid_cols).reindex(idx_all).fillna(False).astype(bool)
     r_todas, n_todas, turn_todas = cartera_sin_limite(ret_all, todas_m, args.coste)
@@ -748,6 +776,9 @@ def main():
         plt.close(fig)
 
     md = ["# Backtest de las reglas", "",
+          ("- **Membresia puntual:** cada accion cuenta solo desde su fecha de alta en el S&P 500 "
+           "(sigue faltando el sesgo de las empresas que salieron del indice)." if args.solo_miembros else
+           "- Universo = componentes ACTUALES desde el inicio (incluye el sesgo de inclusion)."),
           f"- Periodo con señales validas: {ini:%Y-%m-%d} a {fin:%Y-%m-%d}; {usados} tickers"
           + ("" if len(tickers) > 400 else " (NO es el S&P 500 completo)") + ".",
           f"- Deslizamiento: {args.coste * 100:.2f}% por lado. Precios sin ajustar por dividendos.",
