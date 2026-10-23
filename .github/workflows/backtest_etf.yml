@@ -1,0 +1,41 @@
+# Copiar a .github/workflows/backtest_etf.yml  (se lanza a mano desde la pestaña Actions)
+# Prueba de la regla de etapa 2 / SMA30 semanal sobre ETFs: sin sesgo de supervivencia, retorno total.
+name: Backtest ETF
+on:
+  workflow_dispatch:
+    inputs:
+      anios:
+        description: "Años de historico"
+        default: "26"
+      tasa_caja:
+        description: "Rendimiento anual de la caja cuando la regla esta fuera (0.02 = 2%)"
+        default: "0.02"
+      tickers:
+        description: "ETFs separados por comas"
+        default: "SPY,QQQ,DIA,IWM,MDY,EFA,EEM,EWJ,EWG,EWU,TLT,IEF,LQD,HYG,GLD,VNQ,XLK,XLF,XLV,XLE,XLI,XLY,XLP,XLB,XLU"
+jobs:
+  backtest_etf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: cache_etf
+          key: datos-etf-${{ github.run_id }}
+          restore-keys: datos-etf-
+      - name: Backtest ETF
+        run: |
+          python backtest.py --archivo "" --tickers "${{ github.event.inputs.tickers }}" \
+            --años ${{ github.event.inputs.anios }} --total-return \
+            --tasa-caja ${{ github.event.inputs.tasa_caja }} \
+            --corte 2013-01-01 --sin-tramo-desde 2020-01-01 \
+            --cache cache_etf --salida resultados_etf --semillas 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backtest-etf
+          path: resultados_etf
