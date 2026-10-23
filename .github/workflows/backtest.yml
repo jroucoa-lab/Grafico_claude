@@ -8,10 +8,13 @@ on:
         default: "10"
       max_pos:
         description: "Maximo por posicion en $ (varios valores separados por espacio)"
-        default: "2500 5000 10000"
+        default: "5000"
       riesgo:
         description: "Riesgo maximo por operacion en $"
         default: "800"
+      membresia:
+        description: "ambas = componentes actuales Y membresia puntual (fecha de alta); si | no"
+        default: "ambas"
 jobs:
   backtest:
     runs-on: ubuntu-latest
@@ -27,35 +30,59 @@ jobs:
           path: cache_bt
           key: datos-bt-${{ github.run_id }}
           restore-keys: datos-bt-
-      - name: Backtest (uno por cada valor de max_pos; la descarga se hace una sola vez)
+      - name: Refrescar lista del S&P 500 (necesita la fecha de alta)
+        run: rm -f cache_bt/sp500.csv
+      - name: Backtest (por cada max_pos y modo; la descarga se hace una sola vez)
         run: |
+          modos="actual"
+          case "${{ github.event.inputs.membresia }}" in
+            si) modos="puntual" ;;
+            ambas) modos="actual puntual" ;;
+          esac
           for mp in ${{ github.event.inputs.max_pos }}; do
-            python backtest.py --sp500 --años ${{ github.event.inputs.anios }} \
-              --riesgo ${{ github.event.inputs.riesgo }} --max-pos "$mp" \
-              --salida "resultados_backtest/mp_$mp"
+            for modo in $modos; do
+              extra=""
+              if [ "$modo" = "puntual" ]; then extra="--solo-miembros"; fi
+              python backtest.py --sp500 --años ${{ github.event.inputs.anios }} \
+                --riesgo ${{ github.event.inputs.riesgo }} --max-pos "$mp" $extra \
+                --salida "resultados_backtest/mp_${mp}_${modo}"
+            done
           done
-      - name: Comparativas entre valores de max_pos
+      - name: Comparativas
         run: |
           python - <<'PY'
-          import glob, pandas as pd
+          import glob, shutil, pandas as pd
           def juntar(nombre):
               filas = []
               for p in sorted(glob.glob(f"resultados_backtest/mp_*/{nombre}")):
+                  _, mp, modo = p.split("/")[1].split("_")
                   d = pd.read_csv(p)
-                  d.insert(0, "max_pos", p.split("mp_")[1].split("/")[0])
+                  d.insert(0, "membresia", modo)
+                  d.insert(0, "max_pos", mp)
                   filas.append(d)
-              return pd.concat(filas)
+              return pd.concat(filas) if filas else pd.DataFrame()
           cart = juntar("backtest_cartera.csv")
-          cols = ["max_pos", "Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %",
+          cols = ["max_pos", "membresia", "Variante", "Operaciones tomadas", "Omitidas (sin caja)", "CAGR %",
                   "CAGR aleat. media %", "DD max %", "Racha bajo maximos (años)",
                   "Capital invertido medio %", "S&P 500 CAGR %", "Equipond. CAGR %", "Equipond. DD max %"]
           cart[[c for c in cols if c in cart.columns]].to_csv("resultados_backtest/comparativa_max_pos.csv", index=False)
           juntar("backtest_mitades.csv").to_csv("resultados_backtest/comparativa_mitades.csv", index=False)
-          import shutil
-          prim = sorted(glob.glob("resultados_backtest/mp_*/backtest_sin_limite.csv"))[0]
-          shutil.copy(prim, "resultados_backtest/sin_limite.csv")
-          prim = sorted(glob.glob("resultados_backtest/mp_*/backtest_rs_momentum.csv"))[0]
-          shutil.copy(prim, "resultados_backtest/rs_momentum.csv")
+          for nom, sal in (("backtest_sin_limite.csv", "sin_limite"), ("backtest_rs_momentum.csv", "rs_momentum")):
+              for modo in ("actual", "puntual"):
+                  ps = sorted(glob.glob(f"resultados_backtest/mp_*_{modo}/{nom}"))
+                  if ps:
+                      shutil.copy(ps[0], f"resultados_backtest/{sal}_{modo}.csv")
+          try:
+              a = pd.read_csv("resultados_backtest/rs_momentum_actual.csv")
+              p = pd.read_csv("resultados_backtest/rs_momentum_puntual.csv")
+              c = pd.DataFrame({"Cartera": a["Cartera"], "CAGR actual %": a["CAGR %"], "CAGR puntual %": p["CAGR %"],
+                                "Caida actual %": a["DD max %"], "Caida puntual %": p["DD max %"],
+                                "Exceso actual %": a.get("Exceso anual vs todas %"),
+                                "Exceso puntual %": p.get("Exceso anual vs todas %"),
+                                "IC95 puntual": p.get("IC95 exceso"), "Veredicto puntual": p.get("Veredicto")})
+              c.to_csv("resultados_backtest/comparacion_membresia.csv", index=False)
+          except Exception as e:
+              print("Sin comparacion de membresia:", e)
           PY
       - uses: actions/upload-artifact@v4
         with:
