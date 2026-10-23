@@ -38,6 +38,11 @@ RS Mansfield y se mantienen a partes iguales los quintiles (Q1 = RS mas bajo ...
 decil superior y el quintil superior dentro de etapa 2, frente a todas. Sin limite de caja. Si el
 RS ordena de verdad, el rendimiento debe subir de Q1 a Q5.
 
+REGLA POR ACTIVO (backtest_por_activo.csv, si hay 80 tickers o menos): para cada activo compara comprar y
+mantener con la regla "estar dentro solo si esta en etapa 2 (o precio > SMA30 semanal), si no caja".
+Pensado para ETFs (sin sesgo de supervivencia): usa --total-return (con dividendos) y --tasa-caja
+(rendimiento anual de la caja cuando esta fuera). Mide si la regla recorta caidas sin perder rentabilidad.
+
 MEMBRESIA PUNTUAL (--solo-miembros): cada accion solo cuenta desde su fecha de alta en el S&P 500
 (columna "Date added" de Wikipedia). Quita el sesgo de "entro al indice despues de subir"; NO quita el
 de las empresas que salieron del indice. Comparar la ejecucion normal con esta mide ese sesgo.
@@ -87,9 +92,16 @@ CON_RUPTURA = [v for v in VARIANTES if "uptura" in v]
 HS = (20, 60)
 
 
-def preparar_serie(raw, bench_w, et_mkt, seed=0, ticker=""):
+def ajustar_total(raw):
+    """OHLC ajustado por splits Y dividendos (retorno total)."""
+    f = (raw["AdjClose"] / raw["Close"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    return pd.DataFrame({"Open": raw["Open"] * f, "High": raw["High"] * f, "Low": raw["Low"] * f,
+                         "Close": raw["AdjClose"], "Volume": raw["Volume"]}).dropna()
+
+
+def preparar_serie(raw, bench_w, et_mkt, seed=0, ticker="", total=False):
     """Señales y auxiliares, todo calculado solo con informacion disponible en cada fecha."""
-    dd = g.preparar(raw)
+    dd = ajustar_total(raw) if total else g.preparar(raw)
     dw, _ = g.semanal(dd)
     et, m30, _ = g.etapas_serie(dw)
     rs = g.mansfield(dw["Close"], bench_w, 52)
@@ -120,7 +132,8 @@ def preparar_serie(raw, bench_w, et_mkt, seed=0, ticker=""):
          "Etapa 2 sola": (etapa_d == 2),
          "Estado + no extendida (<=15%)": estado & noext,
          "Estado + mercado en etapa 2": estado & mkt,
-         "Etapa 4 (contraste)": (etapa_d == 4)}
+         "Etapa 4 (contraste)": (etapa_d == 4),
+         "Precio > SMA30 semanal": (dw["Close"] > m30).astype(float).reindex(idx, method="ffill") == 1}
     E = {k: x.fillna(False).astype(bool) for k, x in E.items()}
     S = {
         VARIANTES[0]: ruptura,
@@ -357,13 +370,13 @@ def equiponderado(px):
     return out
 
 
-def cartera_sin_limite(ret, cond, coste):
+def cartera_sin_limite(ret, cond, coste, tasa_caja=0.0):
     """Cartera equiponderada de las acciones con cond=True al cierre de t-1 (se mantienen durante t).
     Rebalanceo diario; sin miembros = caja. Descuenta coste por lado sobre la rotacion."""
     w = cond.shift(1, fill_value=False) & ret.notna()
     n = w.sum(axis=1)
     r = ret.where(w).sum(axis=1) / n.replace(0, np.nan)
-    r = r.fillna(0.0)
+    r = r.fillna(tasa_caja / 252)
     peso = w.div(n.replace(0, np.nan), axis=0).fillna(0.0)
     turn = (peso - peso.shift(1).fillna(0.0)).abs().sum(axis=1)
     r_net = r - turn * coste
@@ -410,6 +423,27 @@ def cartera_rs_mensual(ret, rs, lo, hi, coste, filtro=None):
             w_prev = fin / fin.sum()
         prev_day = g_.index[-1]
     return r_out, n_out, t_out
+
+
+def regla_por_activo(ret_t, estado_t, ini, coste, tasa_caja):
+    """Comprar y mantener frente a 'dentro solo si estado (decidido al cierre anterior), si no caja'."""
+    ret_t, estado_t = ret_t[ret_t.index >= ini], estado_t[estado_t.index >= ini]
+    ret_t = ret_t.fillna(0.0)
+    pos = estado_t.shift(1, fill_value=False)
+    turn = pos.astype(float).diff().abs().fillna(0.0)
+    r_reg = ret_t.where(pos, tasa_caja / 252) - turn * coste
+    años = max((ret_t.index[-1] - ret_t.index[0]).days / 365.25, 1e-9)
+
+    def met(r):
+        eq = (1 + r).cumprod()
+        return (eq.iloc[-1] ** (1 / años) - 1) * 100, (eq / eq.cummax() - 1).min() * 100
+    cb, db = met(ret_t)
+    cr, dr = met(r_reg)
+    return {"CAGR comprar y mantener %": round(cb, 1), "Caida comprar y mantener %": round(db, 1),
+            "CAGR regla %": round(cr, 1), "Caida regla %": round(dr, 1),
+            "Dif CAGR": round(cr - cb, 1), "Dif caida (+ = menos caida)": round(dr - db, 1),
+            "% tiempo dentro": round(float(pos.mean() * 100), 0),
+            "Cambios por año": round(float(turn.sum() / años), 1), "Años": round(años, 1)}
 
 
 def exceso_ic(r_a, r_b, n=3000, seed=0):
@@ -465,6 +499,10 @@ def main():
                     help="Tercera ventana: CAGR solo hasta esta fecha (quita el tramo final)")
     ap.add_argument("--solo-miembros", action="store_true",
                     help="Cada accion cuenta solo desde su fecha de alta en el S&P 500 (membresia puntual)")
+    ap.add_argument("--total-return", action="store_true",
+                    help="Usa precios ajustados por dividendos (recomendado para ETFs)")
+    ap.add_argument("--tasa-caja", type=float, default=0.0,
+                    help="Rendimiento anual de la caja cuando la regla esta fuera (0.02 = 2%%)")
     ap.add_argument("--con-objetivo", action="store_true", help="Prueba tambien la salida por altura de base")
     ap.add_argument("--cuenta", type=float, default=100000)
     ap.add_argument("--riesgo", type=float, default=800, help="Riesgo maximo por operacion en dinero")
@@ -522,7 +560,7 @@ def main():
         if k % 100 == 0:
             print(f"  {k}/{len(tickers)}")
         try:
-            P = preparar_serie(datos[t], bench_w, et_mkt, args.semilla, t)
+            P = preparar_serie(datos[t], bench_w, et_mkt, args.semilla, t, args.total_return)
         except Exception as e:  # noqa
             avisos.append(f"{t}: error ({type(e).__name__}: {e})")
             continue
@@ -584,7 +622,17 @@ def main():
     tdf.drop(columns=["k_out"]).to_csv(os.path.join(args.salida, "backtest_trades.csv"), index=False)
 
     # --- Diferencia frente al control
-    dfd = pd.DataFrame([dif_vs_control(tdf, v) for v in VARIANTES if v != CONTROL]) if len(tdf) else pd.DataFrame()
+    dfd = pd.DataFrame()
+    if len(tdf):
+        filas_d = []
+        for v in VARIANTES:
+            if v == CONTROL:
+                continue
+            try:
+                filas_d.append(dif_vs_control(tdf, v))
+            except Exception:  # noqa
+                pass
+        dfd = pd.DataFrame(filas_d)
     if len(dfd):
         dfd.to_csv(os.path.join(args.salida, "backtest_vs_control.csv"), index=False, encoding="utf-8-sig")
 
@@ -602,7 +650,7 @@ def main():
     ret_all = px_ew.pct_change()
     idx_all = px_all.index
     todas_m = pd.DataFrame(valid_cols).reindex(idx_all).fillna(False).astype(bool)
-    r_todas, n_todas, turn_todas = cartera_sin_limite(ret_all, todas_m, args.coste)
+    r_todas, n_todas, turn_todas = cartera_sin_limite(ret_all, todas_m, args.coste, args.tasa_caja)
     fecha_ini = idx_all[np.flatnonzero(todas_m.any(axis=1).values)[0]] if todas_m.values.any() else idx_all[0]
     r_todas = r_todas[r_todas.index >= fecha_ini]
     años_t = (r_todas.index[-1] - r_todas.index[0]).days / 365.25
@@ -636,7 +684,7 @@ def main():
     eqs_sl["Todas"] = eq0
     for nom_c, cols_c in cond_cols.items():
         cm = pd.DataFrame(cols_c).reindex(idx_all).fillna(False).astype(bool)
-        r_c, n_c, t_c = cartera_sin_limite(ret_all, cm, args.coste)
+        r_c, n_c, t_c = cartera_sin_limite(ret_all, cm, args.coste, args.tasa_caja)
         f, eqc = fila_sl(nom_c, r_c, n_c, t_c)
         filas_sl.append(f)
         eqs_sl[nom_c] = eqc
@@ -672,6 +720,23 @@ def main():
         eqs_rs[nom_q] = eq_q
     dfr = pd.DataFrame(filas_rs)
     dfr.to_csv(os.path.join(args.salida, "backtest_rs_momentum.csv"), index=False, encoding="utf-8-sig")
+
+    # --- Regla por activo (pensada para listas cortas, p. ej. ETFs)
+    dfa = pd.DataFrame()
+    if len(closes) <= 80:
+        filas_a = []
+        for nom_r in ("Etapa 2 sola", "Precio > SMA30 semanal"):
+            for t_ in closes:
+                ok_ = valid_cols[t_][valid_cols[t_]]
+                if len(ok_) < 250:
+                    continue
+                ini_t = ok_.index[0]
+                est_t = pd.Series(cond_cols[nom_r][t_]).reindex(idx_all).fillna(False).astype(bool)
+                m_ = regla_por_activo(ret_all[t_], est_t, ini_t, args.coste, args.tasa_caja)
+                filas_a.append({"Activo": t_, "Regla": nom_r, **m_})
+        dfa = pd.DataFrame(filas_a)
+        if len(dfa):
+            dfa.to_csv(os.path.join(args.salida, "backtest_por_activo.csv"), index=False, encoding="utf-8-sig")
     fig, ax = plt.subplots(figsize=(11, 4.8))
     for k_, v_ in eqs_rs.items():
         if k_ in ("Todas", "Q1 (RS mas bajo)", "Q3", "Q5 (RS mas alto)", "Decil superior (D10)"):
@@ -801,6 +866,16 @@ def main():
            "Q1 = acciones con RS mas bajo, Q5 = RS mas alto (entre todas las validas, al cierre del mes anterior). "
            "Si el RS ordena de verdad, el CAGR debe subir de Q1 a Q5. Ojo: el universo son componentes actuales "
            "(algunas entraron al indice despues de subir), lo que favorece al momentum.", "", tabla_md(dfr), ""]
+    if len(dfa):
+        resa = dfa.groupby("Regla").agg(**{"Activos": ("Activo", "size"),
+                                           "Dif CAGR media": ("Dif CAGR", "mean"),
+                                           "Dif caida media (+ = menos caida)": ("Dif caida (+ = menos caida)", "mean"),
+                                           "Activos con menos caida %": ("Dif caida (+ = menos caida)", lambda x: (x > 0).mean() * 100),
+                                           "Activos con >= CAGR %": ("Dif CAGR", lambda x: (x >= 0).mean() * 100),
+                                           "% tiempo dentro medio": ("% tiempo dentro", "mean")}).round(1).reset_index()
+        md += ["## Regla por activo: comprar y mantener frente a la regla", "",
+               f"Caja con rendimiento anual {args.tasa_caja * 100:.1f}%. Retorno " + ("total (con dividendos)." if args.total_return else "solo precio."),
+               "", tabla_md(resa), "", tabla_md(dfa), ""]
     if len(dfm):
         md += ["## CAGR por mitades (cada ventana reinicia el capital)", "",
                f"`antes/desde {corte:%Y-%m}` = dos mitades; `hasta {excl:%Y-%m}` = sin el tramo final. "
@@ -825,6 +900,9 @@ def main():
     print()
     print(dfs[["Cartera", "CAGR %", "DD max %", "% del tiempo invertida", "Acciones medias", "Exceso anual vs todas %",
                "IC95 exceso", "Veredicto"] if "Veredicto" in dfs.columns else ["Cartera", "CAGR %"]].to_string(index=False))
+    if len(dfa):
+        print()
+        print(dfa.groupby("Regla")[["Dif CAGR", "Dif caida (+ = menos caida)", "% tiempo dentro"]].mean().round(1).to_string())
     print()
     print(dfr[["Cartera", "CAGR %", "DD max %", "CAGR antes " + f"{corte:%Y-%m}", "CAGR desde " + f"{corte:%Y-%m}",
                "Acciones medias", "Rotacion anual (x cartera)", "Exceso anual vs todas %", "IC95 exceso",
