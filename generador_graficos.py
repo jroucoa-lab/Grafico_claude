@@ -336,7 +336,9 @@ def cargar_sp500(cache):
     """Lista del S&P 500 (ticker, sector). Se refresca como mucho cada 30 dias."""
     ruta = os.path.join(cache, "sp500.csv")
     if os.path.exists(ruta) and time.time() - os.path.getmtime(ruta) < 30 * 86400:
-        return pd.read_csv(ruta)
+        d_ = pd.read_csv(ruta)
+        if "Alta" in d_.columns:
+            return d_
     try:
         import urllib.request
         req = urllib.request.Request(
@@ -347,6 +349,8 @@ def cargar_sp500(cache):
         df = pd.DataFrame({
             "Ticker": tb["Symbol"].astype(str).str.upper().str.replace(".", "-", regex=False),
             "Sector": tb["GICS Sector"]})
+        if "Date added" in tb.columns:
+            df["Alta"] = pd.to_datetime(tb["Date added"], errors="coerce").dt.strftime("%Y-%m-%d")
         if not 400 <= len(df) <= 600:
             raise ValueError(f"lista con {len(df)} filas")
         os.makedirs(cache, exist_ok=True)
@@ -1752,3 +1756,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
